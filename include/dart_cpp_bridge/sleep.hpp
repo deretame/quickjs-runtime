@@ -48,17 +48,23 @@ inline exec::timed_thread_context& default_timer_context()
 
 // 共享控制块：把 receiver 的完整生命周期与 opstate 解耦，并串行化
 // "完成回调"与"opstate 析构"两个方向：
-//   begin_completion(): 锁内检查 done、move 出 receiver，in_flight++；
-//                       完成回调据此获得唯一的交付权。
+//   begin_completion(): 锁内检查 done、move 出 receiver，in_flight++ 并记录
+//                       完成回调所在线程；完成回调据此获得唯一的交付权。
 //   end_completion():   完成回调结束后 in_flight--，notify_all。
-//   abandon():          opstate 析构入口；置 done、销毁仍持有的 receiver，
-//                       并等待 in_flight == 0（进行中的回调结束）后才返回。
+//   abandon():          opstate 析构入口；置 done、销毁仍持有的 receiver。
+//                       - 析构发生在回调线程自身（协程被 resume 后 co_return，
+//                         帧销毁连带 ~Op）：receiver 已被回调 move 到栈上持有，
+//                         无需等待，直接返回（否则 cv.wait 将永等
+//                         end_completion 而自身又无法执行——死锁）。
+//                       - 其他线程析构（取消）：等待 in_flight == 0，保证
+//                         进行中的回调先结束，不触碰已销毁帧。
 template <typename R>
 struct shared_control_block {
   std::mutex mu;
   std::condition_variable cv;
   bool done = false;
   int in_flight = 0;
+  std::thread::id completing_thread{};
   std::optional<R> rcvr;
 };
 
@@ -70,6 +76,7 @@ std::optional<R> begin_completion(shared_control_block<R>& ctrl)
   std::optional<R> out = std::move(ctrl.rcvr);
   ctrl.rcvr.reset();
   ++ctrl.in_flight;
+  ctrl.completing_thread = std::this_thread::get_id();
   return out;
 }
 
@@ -87,11 +94,18 @@ void abandon(shared_control_block<R>& ctrl)
   std::unique_lock<std::mutex> lk(ctrl.mu);
   ctrl.done = true;
   ctrl.rcvr.reset();
-  // 等待进行中的完成回调结束（end_completion 会在其调用栈上层释放）。
-  // 若析构恰发生在完成回调的 set_* 调用栈内（协程被恢复后立即完成），
-  // cv.wait 释放锁，上层 end_completion 能拿到锁并 notify，无死锁。
+  if (ctrl.in_flight == 0) return;                       // 无进行中回调
+  if (ctrl.completing_thread == std::this_thread::get_id()) return;  // 回调线程自析构
+  // 其他线程取消：等待进行中的回调结束
   ctrl.cv.wait(lk, [&] { return ctrl.in_flight == 0; });
 }
+
+// RAII：完成回调里保证 end_completion 必达（set_value 异常时也不泄漏 in_flight）。
+template <typename R>
+struct completion_guard {
+  shared_control_block<R>& ctrl;
+  ~completion_guard() { end_completion(ctrl); }
+};
 
 // ---------------------------------------------------------------------------
 // std::thread 后端（每 sleep 一个线程）
@@ -127,8 +141,8 @@ struct thread_sleep_sender {
         std::this_thread::sleep_for(dur);
         auto rcvr = begin_completion(*ctrl);
         if (!rcvr) return;  // 已取消/销毁
+        completion_guard<R> guard{*ctrl};  // 保证 end_completion 必达
         stdexec::set_value(std::move(*rcvr));
-        end_completion(*ctrl);
       }).detach();
     }
   };
@@ -180,6 +194,7 @@ struct asio_timer_sender {
       timer.async_wait([ctrl = ctrl](const boost::system::error_code& ec) {
         auto rcvr = begin_completion(*ctrl);
         if (!rcvr) return;  // 已取消/销毁
+        completion_guard<R> guard{*ctrl};  // 保证 end_completion 必达
         if (ec == boost::asio::error::operation_aborted) {
           stdexec::set_stopped(std::move(*rcvr));
         } else if (ec) {
@@ -188,7 +203,6 @@ struct asio_timer_sender {
         } else {
           stdexec::set_value(std::move(*rcvr));
         }
-        end_completion(*ctrl);
       });
     }
   };

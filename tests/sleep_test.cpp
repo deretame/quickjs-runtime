@@ -1,6 +1,7 @@
 #include <dart_cpp_bridge/sleep.hpp>
 
 #include <boost/asio/executor_work_guard.hpp>
+#include <exec/task.hpp>
 #include <exec/windows/windows_thread_pool.hpp>
 #include <gtest/gtest.h>
 #include <stdexec/execution.hpp>
@@ -146,4 +147,36 @@ TEST(Sleep, CancelAsioBackendBeforeCompletion)
 
   EXPECT_EQ(value_calls, 0);
   EXPECT_EQ(stop_calls, 0);
+}
+
+// ---------------------------------------------------------------------------
+// 协程销毁发生在回调线程自身：exec::task 里 co_await 后端 sleep，set_value
+// 在后台/io 线程恢复协程，协程 co_return 时帧销毁连带 opstate 析构——析构
+// 线程 == 回调线程，abandon 必须走 completing_thread 检测路径（不等待），
+// 否则死锁。修复前此测试会挂起。
+// ---------------------------------------------------------------------------
+
+TEST(Sleep, CoroutineDestroysOpOnCallbackThread)
+{
+  auto task = []() -> exec::task<int> {
+    co_await dcb::thread_sleep(5ms);
+    co_return 42;
+  }();
+  auto res = stdexec::sync_wait(std::move(task));
+  ASSERT_TRUE(res.has_value());
+  EXPECT_EQ(std::get<0>(*res), 42);
+}
+
+TEST(Sleep, CoroutineDestroysOpOnAsioCallbackThread)
+{
+  boost::asio::io_context io;
+  io_thread_guard guard(io);
+
+  auto task = [&io]() -> exec::task<int> {
+    co_await dcb::asio_sleep(io, 5ms);
+    co_return 42;
+  }();
+  auto res = stdexec::sync_wait(std::move(task));
+  ASSERT_TRUE(res.has_value());
+  EXPECT_EQ(std::get<0>(*res), 42);
 }

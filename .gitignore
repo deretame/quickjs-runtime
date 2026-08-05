@@ -1,0 +1,26 @@
+# 构建产物
+build/
+out/
+
+# pixi 环境
+.pixi/
+# 注：pixi.lock 应纳入版本管理，勿忽略
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 工具目录
+.reasonix/
+
+# vcpkg（由 scripts/bootstrap_vcpkg.py 克隆，不纳入版本管理）
+third_party/vcpkg/
+
+# IDE
+.vs/
+.vscode/
+*.user
+CMakeUserPresets.json
+
+# 临时文件
+*.log

@@ -1,0 +1,21 @@
+[workspace]
+name = "quickjs-runtime"
+version = "0.1.0"
+description = "C++20 runtime embedding quickjs-ng, with boost-asio and stdexec"
+channels = ["conda-forge"]
+platforms = ["win-64"]
+
+[dependencies]
+python = "==3.13.14"
+cmake = ">=4.0"
+ninja = ">=1.12"
+
+[tasks]
+# 克隆并 bootstrap vcpkg 到 third_party/vcpkg
+setup-vcpkg = "python scripts/bootstrap_vcpkg.py"
+# 配置 CMake（MSVC + vcpkg toolchain + Ninja）
+configure = { cmd = "python scripts/configure.py", depends-on = ["setup-vcpkg"] }
+# 构建
+build = { cmd = "python scripts/build.py", depends-on = ["configure"] }
+# 运行测试
+test = { cmd = "python scripts/test.py", depends-on = ["build"] }

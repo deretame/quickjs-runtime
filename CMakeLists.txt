@@ -42,6 +42,7 @@ add_executable(quickjs_runtime_tests
     tests/test_main.cpp
     tests/stream_test.cpp
     tests/channel_test.cpp
+    tests/sleep_test.cpp
 )
 target_link_libraries(quickjs_runtime_tests PRIVATE
     qjs

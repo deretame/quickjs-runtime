@@ -52,7 +52,7 @@ pixi run build
 ├── pixi.toml               # pixi 环境与任务定义
 ├── vcpkg.json              # vcpkg 依赖清单
 ├── include/
-│   └── dart_cpp_bridge/    # 异步库（stream.hpp / channel.hpp）
+│   └── dart_cpp_bridge/    # 异步库（stream.hpp / channel.hpp / sleep.hpp）
 ├── docs/                   # 使用指南（P2300 执行器模型）
 ├── scripts/                # Python 脚本（pixi run 调用）
 │   ├── bootstrap_vcpkg.py  # 克隆 + bootstrap vcpkg
@@ -61,7 +61,7 @@ pixi run build
 │   ├── build.py            # 构建
 │   └── test.py             # ctest
 ├── src/main.cpp            # 主程序（quickjs-ng + asio + stdexec demo）
-└── tests/                  # gtest 测试（22 个用例）
+└── tests/                  # gtest 测试（28 个用例）
 ```
 
 ## 依赖
@@ -82,5 +82,10 @@ pixi run build
 - `channel.hpp` — Tokio 风格通道：`co::oneshot`（单次投递）、`co::mpsc`（
   `unbounded` 无界 / `bounded` 有界 backpressure / `capacity=0` 会合模式），
   receiver 侧是 `Stream`，可直接组合
+- `sleep.hpp` — 多后端定时器 `dcb::sleep`：默认 `exec::schedule_after` +
+  `timed_thread_scheduler`；另提供 `dcb::thread_sleep`（std::thread）与
+  `dcb::asio_sleep`（boost::asio::steady_timer）对照后端；
+  Windows 线程池后端可用 `exec::schedule_after(exec::windows_thread_pool)`。
+  实施文档见 `docs/exec_timer_sleep.md`
 
 使用指南见 `docs/cpp26_executor_model_usage.md`。

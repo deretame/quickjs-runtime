@@ -1,3 +1,4 @@
+#include <dart_cpp_bridge/sleep.hpp>
 #include <dart_cpp_bridge/stream.hpp>
 
 #include <exec/task.hpp>
@@ -8,62 +9,6 @@
 #include <thread>
 #include <utility>
 #include <vector>
-
-// ---------------------------------------------------------------------------
-// dcb::sleep 的测试实现。
-// 正式实现位于 runtime.hpp（尚未提供），stream.hpp 仅前向声明了它；
-// interval() 工厂需要它，这里用一个最小 sender（std::thread + sleep_for）
-// 顶上，仅用于测试。
-// ---------------------------------------------------------------------------
-namespace dcb {
-namespace detail {
-
-template <typename Rep, typename Period>
-struct SleepSender {
-  using sender_concept = stdexec::sender_tag;
-  using completion_signatures = stdexec::completion_signatures<stdexec::set_value_t()>;
-
-  std::chrono::duration<Rep, Period> dur;
-
-  template <typename R>
-  struct Op {
-    using operation_state_concept = stdexec::operation_state_tag;
-    R rcvr;
-    std::chrono::duration<Rep, Period> dur;
-    std::thread th;
-
-    Op(R r, std::chrono::duration<Rep, Period> d) : rcvr(std::move(r)), dur(d) {}
-    Op(Op&&) = delete;
-    ~Op()
-    {
-      if (th.joinable()) th.join();
-    }
-
-    void start() & noexcept
-    {
-      th = std::thread([this] {
-        std::this_thread::sleep_for(dur);
-        stdexec::set_value(std::move(rcvr));
-      });
-    }
-  };
-
-  template <typename R>
-  Op<R> connect(R&& r) &&
-  {
-    return Op<R>{std::forward<R>(r), dur};
-  }
-};
-
-}  // namespace detail
-
-template <typename Rep, typename Period>
-stdexec::sender auto sleep(std::chrono::duration<Rep, Period> dur)
-{
-  return detail::SleepSender<Rep, Period>{dur};
-}
-
-}  // namespace dcb
 
 namespace {
 

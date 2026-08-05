@@ -21,6 +21,11 @@ find_package(stdexec CONFIG REQUIRED)
 find_package(qjs CONFIG REQUIRED)
 find_package(GTest CONFIG REQUIRED)
 
+# ---- dart_cpp_bridge：header-only 异步库（co::stream + co::channel）----
+add_library(dart_cpp_bridge INTERFACE)
+target_include_directories(dart_cpp_bridge INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(dart_cpp_bridge INTERFACE STDEXEC::stdexec)
+
 # ---- 主程序 ----
 add_executable(quickjs_runtime src/main.cpp)
 target_link_libraries(quickjs_runtime PRIVATE
@@ -33,11 +38,16 @@ target_link_libraries(quickjs_runtime PRIVATE
 
 # ---- 测试 ----
 enable_testing()
-add_executable(quickjs_runtime_tests tests/test_main.cpp)
+add_executable(quickjs_runtime_tests
+    tests/test_main.cpp
+    tests/stream_test.cpp
+    tests/channel_test.cpp
+)
 target_link_libraries(quickjs_runtime_tests PRIVATE
     qjs
     STDEXEC::stdexec
     fmt::fmt
+    dart_cpp_bridge
     GTest::gtest_main
 )
 include(GoogleTest)

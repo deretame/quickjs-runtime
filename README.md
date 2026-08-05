@@ -51,6 +51,9 @@ pixi run build
 ├── CMakeLists.txt          # CMake 工程（C++20）
 ├── pixi.toml               # pixi 环境与任务定义
 ├── vcpkg.json              # vcpkg 依赖清单
+├── include/
+│   └── dart_cpp_bridge/    # 异步库（stream.hpp / channel.hpp）
+├── docs/                   # 使用指南（P2300 执行器模型）
 ├── scripts/                # Python 脚本（pixi run 调用）
 │   ├── bootstrap_vcpkg.py  # 克隆 + bootstrap vcpkg
 │   ├── vs_env.py           # 定位 MSVC 环境（vswhere + vcvars64）
@@ -58,7 +61,7 @@ pixi run build
 │   ├── build.py            # 构建
 │   └── test.py             # ctest
 ├── src/main.cpp            # 主程序（quickjs-ng + asio + stdexec demo）
-└── tests/test_main.cpp     # gtest 测试
+└── tests/                  # gtest 测试（22 个用例）
 ```
 
 ## 依赖
@@ -66,4 +69,18 @@ pixi run build
 - [quickjs-ng](https://github.com/quickjs-ng/quickjs-ng) — 内嵌 JS 引擎
 - [boost-asio](https://www.boost.org/doc/libs/release/libs/asio/) — 异步 I/O
 - [stdexec](https://github.com/NVIDIA/stdexec) — C++26 执行模型（P2300）参考实现
+- [rigtorp/MPMCQueue](https://github.com/rigtorp/MPMCQueue) — 无锁 MPMC 队列（`co::mpsc` 底层）
 - fmt / spdlog / gtest — 格式化、日志、测试
+
+## 异步库（include/dart_cpp_bridge）
+
+基于 stdexec 的 Tokio 风格异步设施（header-only，`dart_cpp_bridge` CMake target）：
+
+- `stream.hpp` — 异步流 `co::stream::Stream<T>`：`from_vector` / `interval` / `once` /
+  `map` / `filter` / `take` / `skip` / `take_while` / `scan` / `zip` / `merge` /
+  `collect` / `fold` / `count` 等
+- `channel.hpp` — Tokio 风格通道：`co::oneshot`（单次投递）、`co::mpsc`（
+  `unbounded` 无界 / `bounded` 有界 backpressure / `capacity=0` 会合模式），
+  receiver 侧是 `Stream`，可直接组合
+
+使用指南见 `docs/cpp26_executor_model_usage.md`。

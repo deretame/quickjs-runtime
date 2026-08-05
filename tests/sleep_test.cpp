@@ -44,6 +44,19 @@ struct io_thread_guard {
   }
 };
 
+// 最小 receiver：统计到达的完成通道（用于取消路径测试）。
+struct counting_receiver {
+  using receiver_concept = stdexec::receiver_tag;
+  int* value_calls;
+  int* stop_calls;
+
+  void set_value() && noexcept { ++*value_calls; }
+  template <class E>
+  void set_error(E&&) && noexcept { ++*stop_calls; }
+  void set_stopped() && noexcept { ++*stop_calls; }
+  auto get_env() const noexcept { return stdexec::empty_env(); }
+};
+
 }  // namespace
 
 // 默认后端：exec::schedule_after + 全局 timed_thread_context
@@ -93,4 +106,44 @@ TEST(Sleep, RepeatedWaits)
   for (int i = 0; i < 5; ++i) {
     expect_sleep_ok(dcb::sleep(10ms), 5ms);
   }
+}
+
+// ---------------------------------------------------------------------------
+// 取消路径（协程挂起中销毁 opstate）：回归测试，验证 begin_completion /
+// abandon 串行化后不崩溃、不悬垂、不泄漏完成。
+// ---------------------------------------------------------------------------
+
+TEST(Sleep, CancelThreadBackendBeforeCompletion)
+{
+  int value_calls = 0;
+  int stop_calls = 0;
+  for (int i = 0; i < 100; ++i) {
+    auto op = stdexec::connect(dcb::thread_sleep(5ms),
+                               counting_receiver{&value_calls, &stop_calls});
+    stdexec::start(op);
+    // op 在此析构 = 取消：后台线程 5ms 后醒来应见 done 短路
+  }
+  // 全部被取消：set_value / set_stopped / set_error 均不应到达
+  EXPECT_EQ(value_calls, 0);
+  EXPECT_EQ(stop_calls, 0);
+}
+
+TEST(Sleep, CancelAsioBackendBeforeCompletion)
+{
+  boost::asio::io_context io;
+  io_thread_guard guard(io);
+
+  int value_calls = 0;
+  int stop_calls = 0;
+  for (int i = 0; i < 100; ++i) {
+    auto op = stdexec::connect(dcb::asio_sleep(io, 5ms),
+                               counting_receiver{&value_calls, &stop_calls});
+    stdexec::start(op);
+    // op 在此析构 = 取消：timer 析构取消 async_wait，迟到的 handler 见 done 短路
+  }
+  // 等 io 线程处理完所有取消的 handler
+  std::this_thread::sleep_for(20ms);
+
+  EXPECT_EQ(value_calls, 0);
+  EXPECT_EQ(stop_calls, 0);
 }

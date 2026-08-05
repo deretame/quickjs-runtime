@@ -112,24 +112,27 @@ namespace dcb {
 - **完成位置**随后端不同：默认（timed 线程）/ 系统线程池 / 新线程 / io 线程。
   需要回到特定上下文时用 `stdexec::continues_on` / `starts_on` 迁移
 - **取消**：timed/windows 后端原生支持 stop token；两个对照后端（std::thread /
-  asio）在"协程挂起中销毁 opstate"时**安全降级**——receiver 由共享控制块
-  `shared_control_block`（mutex + done + optional<receiver>）持有，opstate 析构
-  置 done 并销毁 receiver，后台完成回调到达时发现 done 即静默返回，绝不触碰
-  已销毁的帧（取消即放弃交付）
+  asio）在"协程挂起中销毁 opstate"时**安全串行化**——receiver 由共享控制块
+  `shared_control_block`（mutex + cv + done + in_flight + optional<receiver>）
+  持有：完成回调经 `begin_completion` 取得唯一交付权（in_flight++），opstate
+  析构 `abandon()` 置 done 并**等待 in_flight == 0**（进行中的回调结束）后才
+  销毁 receiver。取消要么令回调短路（done 分支），要么等待回调结束后再析构，
+  两者互斥，不存在悬垂回调访问已销毁帧
 - **生命周期**：所有后端都要求上下文对象活得比 sleep 操作久
 
 ## 5. asio 后端实现要点（自包 sender）
 
 ```cpp
 // asio_timer_sender: io_context& + duration -> sender
-// receiver 由共享控制块 shared_control_block（mutex + done + optional<R>）持有：
-//   - async_wait handler 捕获 shared_ptr（不捕获裸 this），触发时 take_receiver()
-//     在锁内检查 done 并 move 出 receiver，然后锁外完成：
-//       error::operation_aborted -> set_stopped
-//       其他错误             -> set_error
-//       成功                 -> set_value
-//   - opstate 析构（取消路径）调 abandon()：置 done + 销毁 receiver；
-//     timer 析构取消 async_wait，迟到的 handler 见 done 即返回 —— 无悬垂回调
+// receiver 由共享控制块 shared_control_block（mutex + cv + done + in_flight
+// + optional<R>）持有：
+//   - async_wait handler 捕获 shared_ptr（不捕获裸 this），触发时
+//     begin_completion() 在锁内检查 done 并 move 出 receiver（in_flight++），
+//     锁外完成（set_stopped / set_error / set_value），随后 end_completion()
+//     递减并 notify
+//   - opstate 析构（取消路径）调 abandon()：置 done + 销毁 receiver + 等待
+//     in_flight == 0；timer 析构取消 async_wait，迟到的 handler 见 done 短路
+//     —— 完成回调与析构串行化，无悬垂回调
 // 约束：io_context 必须有人 run()（如后台 std::thread 跑 io.run()，
 //       需 executor_work_guard 防止空转返回）
 ```
@@ -155,8 +158,8 @@ namespace dcb {
 - `timed_thread_context` 静态单例的析构顺序（静态析构期再触发 sleep 属 UB，
   实际不会发生；所有 opstate 必须先于 ctx 销毁）
 - 对照后端的完成回调在锁外执行；R 的 move 构造与 receiver 析构假定为
-  noexcept / 无副作用（stdexec receiver 惯例），锁内 move/析构若重入会
-  terminate/死锁（当前风险低）
+  noexcept / 无副作用（stdexec receiver 惯例），begin_completion 锁内 move
+  若抛异常会 terminate（当前风险低）
 - asio 后端要求调用方维护 `io_context` 的 `run()`（配 work_guard），文档需注明
 - `windows_thread_pool` 仅 Windows
 - stdexec 版本升级后 `exec::` API 可能漂移（文档 §3 已锚定 0.10.0）

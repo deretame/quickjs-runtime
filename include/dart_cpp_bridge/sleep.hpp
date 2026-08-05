@@ -13,9 +13,10 @@
 // 注意：
 // - 所有后端要求其执行上下文（timed_thread_context / io_context / pool）活得比
 //   sleep 操作久。
-// - thread_sleep / asio_sleep 两个对照后端在"协程挂起中销毁 opstate"（取消/提前
-//   销毁）时是安全降级：receiver 的完成回调不会再被调用（取消即放弃交付），
-//   不存在悬垂回调访问已销毁帧的问题（receiver 由共享控制块持有，析构互斥）。
+// - 两个对照后端的取消路径（协程挂起中销毁 opstate）是安全的：receiver 由共享
+//   控制块持有，opstate 析构（abandon）置 done 并**等待进行中的完成回调结束**
+//   （in_flight 计数 + 条件变量）后才销毁 receiver——完成回调要么因 done 短路，
+//   要么在 opstate 析构完成前已经结束，不存在悬垂回调访问已销毁帧。
 
 #pragma once
 
@@ -26,6 +27,7 @@
 #include <boost/asio/steady_timer.hpp>
 
 #include <chrono>
+#include <condition_variable>
 #include <exception>
 #include <memory>
 #include <mutex>
@@ -44,35 +46,51 @@ inline exec::timed_thread_context& default_timer_context()
   return ctx;
 }
 
-// 共享控制块：把 receiver 的完整生命周期与 opstate 解耦。
-// opstate 提前析构（取消路径）时置 done 并销毁 receiver；后台完成回调
-// （线程/io 线程）持 shared_ptr 到达时发现 done 即静默返回，绝不触碰
-// 已销毁的帧或 receiver。
+// 共享控制块：把 receiver 的完整生命周期与 opstate 解耦，并串行化
+// "完成回调"与"opstate 析构"两个方向：
+//   begin_completion(): 锁内检查 done、move 出 receiver，in_flight++；
+//                       完成回调据此获得唯一的交付权。
+//   end_completion():   完成回调结束后 in_flight--，notify_all。
+//   abandon():          opstate 析构入口；置 done、销毁仍持有的 receiver，
+//                       并等待 in_flight == 0（进行中的回调结束）后才返回。
 template <typename R>
 struct shared_control_block {
   std::mutex mu;
+  std::condition_variable cv;
   bool done = false;
+  int in_flight = 0;
   std::optional<R> rcvr;
 };
 
-// 取出 receiver（若仍有效）。调用方持有控制块。
 template <typename R>
-std::optional<R> take_receiver(shared_control_block<R>& ctrl)
+std::optional<R> begin_completion(shared_control_block<R>& ctrl)
 {
   std::lock_guard<std::mutex> lk(ctrl.mu);
   if (ctrl.done || !ctrl.rcvr) return std::nullopt;
   std::optional<R> out = std::move(ctrl.rcvr);
   ctrl.rcvr.reset();
+  ++ctrl.in_flight;
   return out;
 }
 
-// 标记取消：opstate 析构入口。
+template <typename R>
+void end_completion(shared_control_block<R>& ctrl) noexcept
+{
+  std::lock_guard<std::mutex> lk(ctrl.mu);
+  --ctrl.in_flight;
+  ctrl.cv.notify_all();
+}
+
 template <typename R>
 void abandon(shared_control_block<R>& ctrl)
 {
-  std::lock_guard<std::mutex> lk(ctrl.mu);
+  std::unique_lock<std::mutex> lk(ctrl.mu);
   ctrl.done = true;
   ctrl.rcvr.reset();
+  // 等待进行中的完成回调结束（end_completion 会在其调用栈上层释放）。
+  // 若析构恰发生在完成回调的 set_* 调用栈内（协程被恢复后立即完成），
+  // cv.wait 释放锁，上层 end_completion 能拿到锁并 notify，无死锁。
+  ctrl.cv.wait(lk, [&] { return ctrl.in_flight == 0; });
 }
 
 // ---------------------------------------------------------------------------
@@ -99,7 +117,7 @@ struct thread_sleep_sender {
     Op(Op&&) = delete;
     ~Op()
     {
-      // 取消路径：置 done 并销毁 receiver；后台线程到达时静默返回。
+      // 取消路径：置 done、销毁 receiver，并等待进行中的完成回调结束。
       abandon(*ctrl);
     }
 
@@ -107,9 +125,10 @@ struct thread_sleep_sender {
     {
       std::thread([ctrl = ctrl, dur = dur] {
         std::this_thread::sleep_for(dur);
-        auto rcvr = take_receiver(*ctrl);
+        auto rcvr = begin_completion(*ctrl);
         if (!rcvr) return;  // 已取消/销毁
         stdexec::set_value(std::move(*rcvr));
+        end_completion(*ctrl);
       }).detach();
     }
   };
@@ -150,8 +169,8 @@ struct asio_timer_sender {
 
     ~Op()
     {
-      // 取消路径：置 done 并销毁 receiver；timer 析构取消 async_wait，
-      // 其 handler（持 ctrl）稍后触发时发现 done 即返回。
+      // 取消路径：置 done、销毁 receiver，等待进行中的 handler 结束；
+      // timer 析构取消 async_wait，迟到的 handler 见 done 即返回。
       abandon(*ctrl);
     }
 
@@ -159,7 +178,7 @@ struct asio_timer_sender {
     {
       timer.expires_after(dur);
       timer.async_wait([ctrl = ctrl](const boost::system::error_code& ec) {
-        auto rcvr = take_receiver(*ctrl);
+        auto rcvr = begin_completion(*ctrl);
         if (!rcvr) return;  // 已取消/销毁
         if (ec == boost::asio::error::operation_aborted) {
           stdexec::set_stopped(std::move(*rcvr));
@@ -169,6 +188,7 @@ struct asio_timer_sender {
         } else {
           stdexec::set_value(std::move(*rcvr));
         }
+        end_completion(*ctrl);
       });
     }
   };

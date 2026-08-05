@@ -13,8 +13,9 @@
 // 注意：
 // - 所有后端要求其执行上下文（timed_thread_context / io_context / pool）活得比
 //   sleep 操作久。
-// - thread_sleep / asio_sleep 在"协程挂起中销毁 opstate"的取消路径上行为未定义
-//   （std::thread 版本会 join 等待；asio 版本 cancel 后 handler 可能异步触发）。
+// - thread_sleep / asio_sleep 两个对照后端在"协程挂起中销毁 opstate"（取消/提前
+//   销毁）时是安全降级：receiver 的完成回调不会再被调用（取消即放弃交付），
+//   不存在悬垂回调访问已销毁帧的问题（receiver 由共享控制块持有，析构互斥）。
 
 #pragma once
 
@@ -24,9 +25,11 @@
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/steady_timer.hpp>
 
-#include <atomic>
 #include <chrono>
 #include <exception>
+#include <memory>
+#include <mutex>
+#include <optional>
 #include <thread>
 #include <utility>
 
@@ -39,6 +42,37 @@ inline exec::timed_thread_context& default_timer_context()
 {
   static exec::timed_thread_context ctx;
   return ctx;
+}
+
+// 共享控制块：把 receiver 的完整生命周期与 opstate 解耦。
+// opstate 提前析构（取消路径）时置 done 并销毁 receiver；后台完成回调
+// （线程/io 线程）持 shared_ptr 到达时发现 done 即静默返回，绝不触碰
+// 已销毁的帧或 receiver。
+template <typename R>
+struct shared_control_block {
+  std::mutex mu;
+  bool done = false;
+  std::optional<R> rcvr;
+};
+
+// 取出 receiver（若仍有效）。调用方持有控制块。
+template <typename R>
+std::optional<R> take_receiver(shared_control_block<R>& ctrl)
+{
+  std::lock_guard<std::mutex> lk(ctrl.mu);
+  if (ctrl.done || !ctrl.rcvr) return std::nullopt;
+  std::optional<R> out = std::move(ctrl.rcvr);
+  ctrl.rcvr.reset();
+  return out;
+}
+
+// 标记取消：opstate 析构入口。
+template <typename R>
+void abandon(shared_control_block<R>& ctrl)
+{
+  std::lock_guard<std::mutex> lk(ctrl.mu);
+  ctrl.done = true;
+  ctrl.rcvr.reset();
 }
 
 // ---------------------------------------------------------------------------
@@ -54,23 +88,29 @@ struct thread_sleep_sender {
   template <typename R>
   struct Op {
     using operation_state_concept = stdexec::operation_state_tag;
-    R rcvr;
+    std::shared_ptr<shared_control_block<R>> ctrl;
     std::chrono::duration<Rep, Period> dur;
-    std::thread th;
 
-    Op(R r, std::chrono::duration<Rep, Period> d) : rcvr(std::move(r)), dur(d) {}
+    Op(R r, std::chrono::duration<Rep, Period> d)
+      : ctrl(std::make_shared<shared_control_block<R>>()), dur(d)
+    {
+      ctrl->rcvr.emplace(std::move(r));
+    }
     Op(Op&&) = delete;
     ~Op()
     {
-      if (th.joinable()) th.join();
+      // 取消路径：置 done 并销毁 receiver；后台线程到达时静默返回。
+      abandon(*ctrl);
     }
 
     void start() & noexcept
     {
-      th = std::thread([this] {
+      std::thread([ctrl = ctrl, dur = dur] {
         std::this_thread::sleep_for(dur);
-        stdexec::set_value(std::move(rcvr));
-      });
+        auto rcvr = take_receiver(*ctrl);
+        if (!rcvr) return;  // 已取消/销毁
+        stdexec::set_value(std::move(*rcvr));
+      }).detach();
     }
   };
 
@@ -98,32 +138,38 @@ struct asio_timer_sender {
   template <typename R>
   struct Op {
     using operation_state_concept = stdexec::operation_state_tag;
-    R rcvr;
+    std::shared_ptr<shared_control_block<R>> ctrl;
     boost::asio::steady_timer timer;
     std::chrono::duration<Rep, Period> dur;
-    std::atomic<bool> done{false};
 
     Op(R r, boost::asio::io_context& io, std::chrono::duration<Rep, Period> d)
-      : rcvr(std::move(r)), timer(io), dur(d)
-    {}
-
-    void complete(const boost::system::error_code& ec) noexcept
+      : ctrl(std::make_shared<shared_control_block<R>>()), timer(io), dur(d)
     {
-      if (done.exchange(true)) return;
-      if (ec == boost::asio::error::operation_aborted) {
-        stdexec::set_stopped(std::move(rcvr));
-      } else if (ec) {
-        stdexec::set_error(std::move(rcvr),
-                           std::make_exception_ptr(boost::system::system_error(ec)));
-      } else {
-        stdexec::set_value(std::move(rcvr));
-      }
+      ctrl->rcvr.emplace(std::move(r));
+    }
+
+    ~Op()
+    {
+      // 取消路径：置 done 并销毁 receiver；timer 析构取消 async_wait，
+      // 其 handler（持 ctrl）稍后触发时发现 done 即返回。
+      abandon(*ctrl);
     }
 
     void start() & noexcept
     {
       timer.expires_after(dur);
-      timer.async_wait([this](const boost::system::error_code& ec) { complete(ec); });
+      timer.async_wait([ctrl = ctrl](const boost::system::error_code& ec) {
+        auto rcvr = take_receiver(*ctrl);
+        if (!rcvr) return;  // 已取消/销毁
+        if (ec == boost::asio::error::operation_aborted) {
+          stdexec::set_stopped(std::move(*rcvr));
+        } else if (ec) {
+          stdexec::set_error(std::move(*rcvr),
+                             std::make_exception_ptr(boost::system::system_error(ec)));
+        } else {
+          stdexec::set_value(std::move(*rcvr));
+        }
+      });
     }
   };
 

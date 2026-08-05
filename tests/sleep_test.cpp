@@ -24,6 +24,26 @@ void expect_sleep_ok(Sender&& s, std::chrono::milliseconds min_wait)
   EXPECT_GE(elapsed, min_wait);
 }
 
+// io_context + 后台 run 线程的 RAII：断言失败提前 return 时也会 stop + join。
+struct io_thread_guard {
+  boost::asio::io_context& io;
+  boost::asio::executor_work_guard<boost::asio::io_context::executor_type> work;
+  std::thread th;
+
+  explicit io_thread_guard(boost::asio::io_context& i)
+    : io(i)
+    , work(boost::asio::make_work_guard(io))
+    , th([&io = i] { io.run(); })
+  {}
+
+  ~io_thread_guard()
+  {
+    work.reset();
+    io.stop();
+    if (th.joinable()) th.join();
+  }
+};
+
 }  // namespace
 
 // 默认后端：exec::schedule_after + 全局 timed_thread_context
@@ -49,15 +69,10 @@ TEST(Sleep, StdThreadBackend)
 TEST(Sleep, AsioTimerBackend)
 {
   boost::asio::io_context io;
-  // work_guard 防止 run() 在没有 pending 操作时立即返回（经典 asio 竞态）
-  auto work = boost::asio::make_work_guard(io);
-  std::thread io_thread([&io] { io.run(); });
+  // RAII：work_guard 防 run() 空转返回；断言失败时析构也会 stop + join
+  io_thread_guard io_guard(io);
 
   expect_sleep_ok(dcb::asio_sleep(io, 20ms), 15ms);
-
-  work.reset();
-  io.stop();
-  io_thread.join();
 }
 
 // 并行 3 个 sleep：总耗时应接近单个周期（真定时，不串行）

@@ -16,7 +16,7 @@ endif()
 # ---- 第三方库（均由 vcpkg 提供）----
 find_package(fmt CONFIG REQUIRED)
 find_package(spdlog CONFIG REQUIRED)
-find_package(Boost REQUIRED COMPONENTS asio)
+find_package(Boost REQUIRED COMPONENTS asio uuid)
 find_package(stdexec CONFIG REQUIRED)
 find_package(qjs CONFIG REQUIRED)
 find_package(GTest CONFIG REQUIRED)
@@ -26,10 +26,16 @@ add_library(dart_cpp_bridge INTERFACE)
 target_include_directories(dart_cpp_bridge INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(dart_cpp_bridge INTERFACE STDEXEC::stdexec)
 
+# ---- qjsbind：QuickJS-NG 的 C++ 自动绑定层（header-only）----
+add_library(qjsbind INTERFACE)
+target_include_directories(qjsbind INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(qjsbind INTERFACE qjs Boost::uuid)
+
 # ---- 主程序 ----
 add_executable(quickjs_runtime src/main.cpp)
 target_link_libraries(quickjs_runtime PRIVATE
     qjs
+    qjsbind
     Boost::asio
     STDEXEC::stdexec
     fmt::fmt
@@ -43,9 +49,14 @@ add_executable(quickjs_runtime_tests
     tests/stream_test.cpp
     tests/channel_test.cpp
     tests/sleep_test.cpp
+    tests/m1_binding_test.cpp
+    tests/m2_binding_test.cpp
+    tests/m3_binding_test.cpp
+    tests/m4_binding_test.cpp
 )
 target_link_libraries(quickjs_runtime_tests PRIVATE
     qjs
+    qjsbind
     STDEXEC::stdexec
     fmt::fmt
     dart_cpp_bridge

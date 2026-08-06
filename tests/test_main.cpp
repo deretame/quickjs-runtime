@@ -3,6 +3,33 @@
 
 #include <stdexec/execution.hpp>
 
+#ifdef _WIN32
+// 抑制 Windows 断言/abort/GPF 弹窗：崩溃时只输出到 stderr，进程以非零码退出
+// （否则调试构建的 Assertion failed 对话框需要手动关闭，CI/脚本无法自动处理）
+#include <crtdbg.h>
+#include <cstdlib>
+#include <windows.h>
+namespace {
+struct suppress_crash_dialogs {
+    suppress_crash_dialogs()
+    {
+        // CRT assert / abort 报告改走 stderr（默认弹窗）
+        _CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE);
+        _CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDERR);
+        _CrtSetReportMode(_CRT_ERROR, _CRTDBG_MODE_FILE);
+        _CrtSetReportFile(_CRT_ERROR, _CRTDBG_FILE_STDERR);
+        _CrtSetReportMode(_CRT_WARN, _CRTDBG_MODE_FILE);
+        _CrtSetReportFile(_CRT_WARN, _CRTDBG_FILE_STDERR);
+        // abort() 不写消息、不弹窗、不调报告器，直接终止
+        // （新版 UCRT flag 宏为 _WRITE_ABORT_MSG | _CALL_REPORTFAULT）
+        _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+        // 全局错误模式：不弹「严重错误/GPF/打开文件失败」对话框
+        SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
+    }
+} g_suppress_crash_dialogs;
+} // namespace
+#endif
+
 TEST(Quickjs, Eval) {
     JSRuntime* rt = JS_NewRuntime();
     ASSERT_NE(rt, nullptr);

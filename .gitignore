@@ -22,5 +22,15 @@ third_party/vcpkg/
 *.user
 CMakeUserPresets.json
 
+# 编译器中间产物（临时 mini 验证 / cl 直编残留）
+*.obj
+*.o
+*.pdb
+*.ilk
+*.exe
+*.dll
+NUL.obj
+
 # 临时文件
 *.log
+*.tmp

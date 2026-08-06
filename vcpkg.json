@@ -6,7 +6,8 @@
   "dependencies": [
     "quickjs-ng",
     "boost-asio",
-    "stdexec",
+    "boost-uuid",
+    { "name": "stdexec", "features": ["asio"] },
     "mpmcqueue",
     "fmt",
     "spdlog",

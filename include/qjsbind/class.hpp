@@ -24,9 +24,9 @@ namespace qjs {
 
 // ---- js_convert<T>：bound class 值语义（非 builtin 类型走这里）----
 // to_js：拷贝包装成 JS 实例（new T(v) 进 opaque）；from_js：GetOpaque2 取引用后拷贝。
-// 运行期校验 T 已注册（须先 class_<T> 注册）。
+// 运行期校验 T 已注册（须先 class_<T> 注册）。Opt<T> 排除（有专属特化，见 function.hpp）。
 template <class T>
-struct js_convert<T, std::enable_if_t<!is_builtin_convertible_v<T>>> {
+struct js_convert<T, std::enable_if_t<!is_builtin_convertible_v<T> && !is_opt_param<T>::value>> {
     static JSValue to_js(JSContext* ctx, const T& v)
     {
         JSClassID id = registry_of(ctx).id_of<T>(ctx);
@@ -54,15 +54,30 @@ JSValue ctor_impl(JSContext* ctx, JSValueConst new_target, int argc, JSValueCons
     std::index_sequence<I...>)
 {
     try {
-        if (argc < static_cast<int>(sizeof...(Args)))
+        // 最小必需参数 = 非 Opt 的普通参数个数；不足的槽位补 JS_UNDEFINED
+        constexpr std::size_t min_args = ((!is_opt_param<Args>::value) + ... + 0);
+        if (argc < static_cast<int>(min_args))
             return JS_ThrowTypeError(ctx, "missing argument(s): expected %d",
-                static_cast<int>(sizeof...(Args)));
+                static_cast<int>(min_args));
+        auto get_arg = [&](std::size_t i) -> JSValueConst {
+            return i < static_cast<std::size_t>(argc) ? argv[i] : JS_UNDEFINED;
+        };
 
-        // 1. 参数包 → new T(args...)
-        auto tup = std::make_tuple(js_convert<Args>::from_js(ctx, argv[I])...);
-        T* ptr = std::apply(
-            [](auto&&... a) { return new T(std::forward<decltype(a)>(a)...); },
-            std::move(tup));
+        // 参数包（Opt 槽位已补 undefined）
+        auto tup = std::make_tuple(js_convert<Args>::from_js(ctx, get_arg(I))...);
+
+        // 1. 构造 T：
+        //    - 有 qjs_init 扩展点 → 默认构造 + qjs_init(ctx, args...)（init 参数转换）
+        //    - 否则 → new T(args...)
+        T* ptr = nullptr;
+        if constexpr (requires(JSContext* c, T& t, Args&... a) { t.qjs_init(c, a...); }) {
+            ptr = new T();
+            std::apply([&](auto&... a) { ptr->qjs_init(ctx, a...); }, tup);
+        } else {
+            ptr = std::apply(
+                [](auto&&... a) { return new T(std::forward<decltype(a)>(a)...); },
+                std::move(tup));
+        }
 
         // 2. prototype：new_target.prototype（支持 extends）失败回退 class proto
         JSClassID id = registry_of(ctx).id_of<T>(ctx);

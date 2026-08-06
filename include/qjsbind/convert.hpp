@@ -109,6 +109,19 @@ struct js_convert<int64_t> {
     }
 };
 
+// uint64_t：MSVC 下是 unsigned long long，与 int64_t 特化不匹配，需独立特化
+template <>
+struct js_convert<uint64_t> {
+    static JSValue to_js(JSContext* ctx, uint64_t v) { return JS_NewBigInt64(ctx, static_cast<int64_t>(v)); }
+    static uint64_t from_js(JSContext* ctx, JSValueConst v)
+    {
+        int64_t r = 0;
+        if (JS_ToInt64(ctx, &r, v) < 0)
+            throw_type_error(ctx, "expected uint64");
+        return static_cast<uint64_t>(r);
+    }
+};
+
 template <>
 struct js_convert<double> {
     static JSValue to_js(JSContext* ctx, double v) { return JS_NewFloat64(ctx, v); }

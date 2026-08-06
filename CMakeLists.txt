@@ -16,7 +16,9 @@ endif()
 # ---- 第三方库（均由 vcpkg 提供）----
 find_package(fmt CONFIG REQUIRED)
 find_package(spdlog CONFIG REQUIRED)
-find_package(Boost REQUIRED COMPONENTS asio uuid)
+find_package(Boost REQUIRED COMPONENTS asio uuid url)
+find_package(OpenSSL REQUIRED)
+find_package(utf8cpp CONFIG REQUIRED)
 find_package(stdexec CONFIG REQUIRED)
 find_package(qjs CONFIG REQUIRED)
 find_package(GTest CONFIG REQUIRED)
@@ -29,13 +31,28 @@ target_link_libraries(dart_cpp_bridge INTERFACE STDEXEC::stdexec)
 # ---- qjsbind：QuickJS-NG 的 C++ 自动绑定层（header-only）----
 add_library(qjsbind INTERFACE)
 target_include_directories(qjsbind INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(qjsbind INTERFACE qjs Boost::uuid)
+target_link_libraries(qjsbind INTERFACE qjs Boost::uuid Boost::url utf8cpp::utf8cpp)
+
+# ---- qjsbind_net：fetch 网络层（boost::beast + OpenSSL，静态库）----
+add_library(qjsbind_net STATIC src/net/http_client.cpp)
+target_include_directories(qjsbind_net PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+target_link_libraries(qjsbind_net PUBLIC
+    Boost::asio
+    Boost::url
+    OpenSSL::SSL
+    OpenSSL::Crypto
+    STDEXEC::stdexec
+)
 
 # ---- 主程序 ----
 add_executable(quickjs_runtime src/main.cpp)
 target_link_libraries(quickjs_runtime PRIVATE
     qjs
     qjsbind
+    qjsbind_net
     Boost::asio
     STDEXEC::stdexec
     fmt::fmt
@@ -53,10 +70,12 @@ add_executable(quickjs_runtime_tests
     tests/m2_binding_test.cpp
     tests/m3_binding_test.cpp
     tests/m4_binding_test.cpp
+    tests/fetch_test.cpp
 )
 target_link_libraries(quickjs_runtime_tests PRIVATE
     qjs
     qjsbind
+    qjsbind_net
     STDEXEC::stdexec
     fmt::fmt
     dart_cpp_bridge

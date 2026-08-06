@@ -97,6 +97,19 @@ struct Opt {
     const T* operator->() const { return &*value; }
 };
 
+// js_convert<Opt<T>>：undefined/null → 空；否则转 T（供 ctor 可选参数等场景）
+template <class T>
+struct js_convert<Opt<T>> {
+    static Opt<T> from_js(JSContext* ctx, JSValueConst v)
+    {
+        if (JS_IsUndefined(v) || JS_IsNull(v))
+            return {};
+        Opt<T> o;
+        o.value.emplace(js_convert<T>::from_js(ctx, v));
+        return o;
+    }
+};
+
 // 排空剩余参数
 template <class T>
 struct Rest {

@@ -1,0 +1,461 @@
+﻿// qjsbind::web —— URL / URLSearchParams（基于 Boost.URL，WHATWG 语义子集）
+//
+// v1 边界：
+//   - URL：绝对/相对（base resolve）解析、各属性读写；origin 用 encoded_origin；
+//   - URLSearchParams：构造（string/record/序列 of pairs/另一实例）、增删查改、sort；
+//   - entries/keys/values 返回数组（非规范迭代器对象），Symbol.iterator 指向 entries；
+//   - searchParams 与 URL.search 的实时联动未实现（getter 每次重新解析，不回写）。
+#pragma once
+
+#include <qjsbind/class.hpp>
+#include <qjsbind/context.hpp>
+#include <qjsbind/value.hpp>
+#include <qjsbind/web/utf8.hpp>
+
+#include <boost/url/parse.hpp>
+#include <boost/url/url.hpp>
+
+#include <algorithm>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+namespace qjsbind::web {
+
+// ---------- 工具 ----------
+
+inline int hex_value(char c) {
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F')
+        return c - 'A' + 10;
+    return -1;
+}
+
+// percent-decode；plus_as_space=true 时 '+' → ' '（application/x-www-form-urlencoded）
+inline std::string percent_decode(std::string_view s, bool plus_as_space) {
+    std::string out;
+    out.reserve(s.size());
+    for (size_t i = 0; i < s.size(); ++i) {
+        const char c = s[i];
+        if (c == '%' && i + 2 < s.size()) {
+            const int hi = hex_value(s[i + 1]);
+            const int lo = hex_value(s[i + 2]);
+            if (hi >= 0 && lo >= 0) {
+                out.push_back(static_cast<char>((hi << 4) | lo));
+                i += 2;
+                continue;
+            }
+        }
+        if (c == '+' && plus_as_space)
+            out.push_back(' ');
+        else
+            out.push_back(c);
+    }
+    return out;
+}
+
+// form 序列化：name=value&...，空格 → '+'，非 unreserved → %XX
+inline std::string form_encode(const std::vector<std::pair<std::string, std::string>>& list) {
+    std::string out;
+    bool first = true;
+    for (const auto& [k, v] : list) {
+        if (!first)
+            out.push_back('&');
+        first = false;
+        out += percent_encode(k, true);
+        out.push_back('=');
+        out += percent_encode(v, true);
+    }
+    return out;
+}
+
+// ---------- URLSearchParams ----------
+
+struct UrlSearchParamsImpl {
+    std::vector<std::pair<std::string, std::string>> list; // 解码后的键值（插入序）
+
+    void qjs_init(JSContext* ctx, qjs::Opt<qjs::Value> init); // 定义见 url_search_params_from 之后
+
+    static UrlSearchParamsImpl from_query(std::string_view q) {
+        UrlSearchParamsImpl out;
+        if (!q.empty() && q.front() == '?')
+            q.remove_prefix(1);
+        size_t pos = 0;
+        while (pos <= q.size()) {
+            const size_t amp = q.find('&', pos);
+            const std::string_view item = q.substr(pos, amp == std::string_view::npos
+                                                          ? q.size() - pos
+                                                          : amp - pos);
+            if (!item.empty()) {
+                const size_t eq = item.find('=');
+                const std::string_view k = item.substr(0, eq);
+                const std::string_view v =
+                    eq == std::string_view::npos ? std::string_view{} : item.substr(eq + 1);
+                out.list.push_back({percent_decode(k, true), percent_decode(v, true)});
+            }
+            if (amp == std::string_view::npos)
+                break;
+            pos = amp + 1;
+        }
+        return out;
+    }
+
+    std::string to_query() const { return form_encode(list); }
+
+    void append(const std::string& name, const std::string& value) {
+        list.push_back({name, value});
+    }
+    void erase(const std::string& name) {
+        std::erase_if(list, [&](const auto& p) { return p.first == name; });
+    }
+    bool has(const std::string& name) const {
+        for (const auto& [k, v] : list)
+            if (k == name)
+                return true;
+        return false;
+    }
+    std::optional<std::string> get(const std::string& name) const {
+        for (const auto& [k, v] : list)
+            if (k == name)
+                return v;
+        return std::nullopt;
+    }
+    std::vector<std::string> get_all(const std::string& name) const {
+        std::vector<std::string> out;
+        for (const auto& [k, v] : list)
+            if (k == name)
+                out.push_back(v);
+        return out;
+    }
+    void set(const std::string& name, const std::string& value) {
+        bool replaced = false;
+        for (size_t i = 0; i < list.size();) {
+            if (list[i].first == name) {
+                if (!replaced) {
+                    list[i].second = value;
+                    replaced = true;
+                    ++i;
+                } else {
+                    list.erase(list.begin() + static_cast<std::ptrdiff_t>(i));
+                }
+            } else {
+                ++i;
+            }
+        }
+        if (!replaced)
+            list.push_back({name, value});
+    }
+    void sort() {
+        std::stable_sort(list.begin(), list.end(),
+                         [](const auto& a, const auto& b) { return a.first < b.first; });
+    }
+};
+
+// 判断 JS 值是否为已绑定的 URLSearchParamsImpl 实例
+inline bool is_url_search_params_instance(JSContext* ctx, JSValueConst v) {
+    if (!JS_IsObject(v))
+        return false;
+    auto& reg = qjs::registry_of(ctx);
+    if (!reg.is_registered<UrlSearchParamsImpl>())
+        return false;
+    return reg.id_of<UrlSearchParamsImpl>(ctx) == JS_GetClassID(v);
+}
+
+// JS init 参数 → 键值对列表（前向声明，供 qjs_init；定义见后）
+inline UrlSearchParamsImpl url_search_params_from(JSContext* ctx, JSValueConst init);
+
+// qjs_init 类外定义（依赖 url_search_params_from）
+inline void UrlSearchParamsImpl::qjs_init(JSContext* ctx, qjs::Opt<qjs::Value> init) {
+    if (init)
+        *this = url_search_params_from(ctx, init->raw());
+}
+
+// JS init 参数 → 键值对列表（string / URLSearchParams 实例 / record / 序列 of pairs）
+inline UrlSearchParamsImpl url_search_params_from(JSContext* ctx, JSValueConst init) {
+    if (JS_IsUndefined(init) || JS_IsNull(init))
+        return {};
+    if (JS_IsString(init)) {
+        size_t len = 0;
+        const char* s = JS_ToCStringLen(ctx, &len, init);
+        if (!s)
+            throw qjs::js_error(ctx, JS_GetException(ctx));
+        UrlSearchParamsImpl out = UrlSearchParamsImpl::from_query(std::string_view(s, len));
+        JS_FreeCString(ctx, s);
+        return out;
+    }
+    if (is_url_search_params_instance(ctx, init)) {
+        const auto* other = qjs::registry_of(ctx).opaque<UrlSearchParamsImpl>(ctx, init);
+        return *other;
+    }
+    if (JS_IsArray(init)) {
+        UrlSearchParamsImpl out;
+        qjs::Array arr(ctx, init);
+        for (std::size_t i = 0; i < arr.length(); ++i) {
+            qjs::Value item = arr.get(i);
+            if (!JS_IsArray(item.raw())) {
+                JS_Throw(ctx, JS_NewTypeError(ctx, "URLSearchParams: 序列项不是 [name, value] 数组"));
+                throw qjs::js_error(ctx, JS_GetException(ctx));
+            }
+            qjs::Array pair(ctx, item.raw());
+            qjs::Value k = pair.get(0);
+            qjs::Value v = pair.get(1);
+            out.list.push_back({k.as<std::string>(), v.as<std::string>()});
+        }
+        return out;
+    }
+    if (JS_IsObject(init)) {
+        UrlSearchParamsImpl out;
+        JSPropertyEnum* props = nullptr;
+        uint32_t nprops = 0;
+        if (JS_GetOwnPropertyNames(ctx, &props, &nprops, init,
+                                   JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY) < 0)
+            throw qjs::js_error(ctx, JS_GetException(ctx));
+        for (uint32_t i = 0; i < nprops; ++i) {
+            qjs::Value key(ctx, JS_AtomToString(ctx, props[i].atom));
+            qjs::Value val(ctx, JS_GetProperty(ctx, init, props[i].atom));
+            out.list.push_back({key.as<std::string>(), val.as<std::string>()});
+        }
+        js_free(ctx, props);
+        return out;
+    }
+    JS_Throw(ctx, JS_NewTypeError(ctx, "URLSearchParams: 不支持的 init 参数"));
+    throw qjs::js_error(ctx, JS_GetException(ctx));
+}
+
+// JS 数组（每项 [name, value] 或 name）构造（entries/keys/values 的 v1 返回形态）
+inline qjs::Value pairs_to_js_array(JSContext* ctx,
+                                    const std::vector<std::pair<std::string, std::string>>& list,
+                                    bool keys_only) {
+    qjs::Array arr(ctx, JS_NewArray(ctx));
+    std::size_t idx = 0;
+    for (const auto& [k, v] : list) {
+        if (keys_only) {
+            arr.set(idx++, qjs::Value(ctx, JS_NewString(ctx, k.c_str())));
+        } else {
+            qjs::Array pair(ctx, JS_NewArray(ctx));
+            pair.set(0, qjs::Value(ctx, JS_NewString(ctx, k.c_str())));
+            pair.set(1, qjs::Value(ctx, JS_NewString(ctx, v.c_str())));
+            arr.set(idx++, qjs::Value(std::move(pair)));
+        }
+    }
+    return qjs::Value(std::move(arr));
+}
+
+inline void install_url_search_params(qjs::Context& ctx) {
+    auto cls = qjs::class_<UrlSearchParamsImpl>(ctx, "URLSearchParams")
+                   .constructor<qjs::Opt<qjs::Value>>()
+                   .method("append", &UrlSearchParamsImpl::append)
+                   .method("delete", &UrlSearchParamsImpl::erase)
+                   .method("has", &UrlSearchParamsImpl::has)
+                   .method("get", [](qjs::Ctx ctx, qjs::This<UrlSearchParamsImpl> self,
+                                     const std::string& name) -> qjs::Value {
+                       const auto v = self->get(name);
+                       return v ? qjs::Value(ctx.ctx, JS_NewString(ctx.ctx, v->c_str()))
+                                : qjs::Value(ctx.ctx, JS_NULL);
+                   })
+                   .method("getAll", &UrlSearchParamsImpl::get_all)
+                   .method("set", &UrlSearchParamsImpl::set)
+                   .method("sort", &UrlSearchParamsImpl::sort)
+                   .method("toString", &UrlSearchParamsImpl::to_query)
+                   .method("entries",
+                           [](qjs::Ctx ctx, qjs::This<UrlSearchParamsImpl> self) -> qjs::Value {
+                               return pairs_to_js_array(ctx.ctx, self->list, false);
+                           })
+                   .method("keys", [](qjs::Ctx ctx, qjs::This<UrlSearchParamsImpl> self) -> qjs::Value {
+                       return pairs_to_js_array(ctx.ctx, self->list, true);
+                   })
+                   .method("values", [](qjs::Ctx ctx, qjs::This<UrlSearchParamsImpl> self) -> qjs::Value {
+                       std::vector<std::string> vals;
+                       for (const auto& [k, v] : self->list)
+                           vals.push_back(v);
+                       qjs::Array arr(ctx.ctx, JS_NewArray(ctx.ctx));
+                       std::size_t i = 0;
+                       for (const auto& v : vals)
+                           arr.set(i++, qjs::Value(ctx.ctx, JS_NewString(ctx.ctx, v.c_str())));
+                       return qjs::Value(std::move(arr));
+                   })
+                   .method("forEach",
+                           [](qjs::Ctx ctx, qjs::This<UrlSearchParamsImpl> self, qjs::Function cb,
+                              qjs::Opt<qjs::Value> this_arg) {
+                               for (const auto& [k, v] : self->list) {
+                                   JSValue args[3] = {JS_NewString(ctx.ctx, v.c_str()),
+                                                      JS_NewString(ctx.ctx, k.c_str()),
+                                                      JS_DupValue(ctx.ctx, this_arg ? this_arg->raw()
+                                                                                   : JS_UNDEFINED)};
+                                   qjs::Value r = cb.call_raw(3, args);
+                                   JS_FreeValue(ctx.ctx, args[0]);
+                                   JS_FreeValue(ctx.ctx, args[1]);
+                                   JS_FreeValue(ctx.ctx, args[2]);
+                                   if (r.is_exception())
+                                       throw qjs::js_error(ctx.ctx, JS_GetException(ctx.ctx));
+                               }
+                           });
+    ctx.globals().set("URLSearchParams", cls.constructor_function());
+}
+
+// ---------- URL ----------
+
+struct UrlImpl {
+    boost::urls::url u; // 绝对 URL
+
+    void qjs_init(JSContext* ctx, qjs::Opt<qjs::Value> url, qjs::Opt<qjs::Value> base) {
+        std::string base_str;
+        if (base && !base->is_undefined() && !base->is_null())
+            base_str = base->as<std::string>();
+        *this = parse(ctx, url ? url->as<std::string>() : std::string{}, base_str);
+    }
+
+    // WHATWG 解析：绝对引用直接用；相对引用必须带 base（无 base → TypeError）
+    static UrlImpl parse(JSContext* ctx, std::string_view str, std::string_view base) {
+        auto r = boost::urls::parse_uri_reference(str);
+        if (r.has_error()) {
+            JS_Throw(ctx, JS_NewTypeError(ctx, "URL: 无法解析 '%s'", std::string(str).c_str()));
+            throw qjs::js_error(ctx, JS_GetException(ctx));
+        }
+        UrlImpl out;
+        if (r->has_scheme()) {
+            out.u = boost::urls::url(*r);
+        } else {
+            if (base.empty())
+                JS_Throw(ctx, JS_NewTypeError(ctx, "URL: 相对引用缺少 base"));
+    throw qjs::js_error(ctx, JS_GetException(ctx));
+            auto rb = boost::urls::parse_uri_reference(base);
+            if (rb.has_error())
+                JS_Throw(ctx, JS_NewTypeError(ctx, "URL: base 无法解析"));
+    throw qjs::js_error(ctx, JS_GetException(ctx));
+            out.u = boost::urls::url(*rb);
+            auto res = out.u.resolve(*r);
+            if (res.has_error())
+                JS_Throw(ctx, JS_NewTypeError(ctx, "URL: 相对解析失败"));
+    throw qjs::js_error(ctx, JS_GetException(ctx));
+        }
+        return out;
+    }
+
+    std::string href() const { return u.buffer(); }
+    std::string protocol() const { return std::string(u.scheme()) + ":"; }
+    std::string hostname() const { return std::string(u.encoded_host()); }
+    std::string host() const { return std::string(u.encoded_host_and_port()); }
+    // WHATWG：默认端口（http 80 / https 443）显示为空
+    std::string port() const {
+        const std::string p(u.port());
+        const std::string s(u.scheme());
+        if ((s == "http" && p == "80") || (s == "https" && p == "443"))
+            return "";
+        return p;
+    }
+    std::string pathname() const { return std::string(u.encoded_path()); }
+    std::string search() const {
+        return u.has_query() ? "?" + std::string(u.encoded_query()) : "";
+    }
+    std::string hash() const {
+        return u.has_fragment() ? "#" + std::string(u.encoded_fragment()) : "";
+    }
+    std::string origin() const { return std::string(u.encoded_origin()); }
+    std::string to_string() const { return href(); }
+
+    // ---- setters（WHATWG 语义子集）----
+    void set_href(JSContext* ctx, const std::string& v) { u = parse(ctx, v, "").u; }
+    void set_protocol(const std::string& v) {
+        std::string s = v;
+        if (!s.empty() && s.back() == ':')
+            s.pop_back();
+        u.set_scheme(s);
+    }
+    void set_hostname(const std::string& v) { u.set_encoded_host(v); }
+    void set_host(const std::string& v) {
+        // "host:port" → 拆开设置（v1：按最后一个 ':' 拆，IPv6 场景简化）
+        const size_t colon = v.rfind(':');
+        if (colon == std::string::npos) {
+            u.set_encoded_host(v);
+        } else {
+            u.set_encoded_host(v.substr(0, colon));
+            u.set_port(v.substr(colon + 1));
+        }
+    }
+    void set_port(const std::string& v) {
+        if (v.empty())
+            u.remove_port();
+        else
+            u.set_port(v);
+    }
+    void set_pathname(const std::string& v) { u.set_encoded_path(v); }
+    void set_search(const std::string& v) {
+        std::string s = v;
+        if (!s.empty() && s.front() == '?')
+            s.erase(0, 1);
+        if (s.empty())
+            u.remove_query();
+        else
+            u.set_encoded_query(s);
+    }
+    void set_hash(const std::string& v) {
+        std::string s = v;
+        if (!s.empty() && s.front() == '#')
+            s.erase(0, 1);
+        if (s.empty())
+            u.remove_fragment();
+        else
+            u.set_encoded_fragment(s);
+    }
+};
+
+inline void install_url(qjs::Context& ctx) {
+    install_url_search_params(ctx);
+    auto cls = qjs::class_<UrlImpl>(ctx, "URL")
+                   .constructor<qjs::Opt<qjs::Value>, qjs::Opt<qjs::Value>>()
+                   .getter("href", [](qjs::This<UrlImpl> self) { return self->href(); })
+                   .setter("href", [](qjs::Ctx ctx, qjs::This<UrlImpl> self, const std::string& v) {
+                       self->set_href(ctx.ctx, v); // 解析失败 → TypeError
+                   })
+                   .getter("protocol", [](qjs::This<UrlImpl> self) { return self->protocol(); })
+                   .setter("protocol", [](qjs::This<UrlImpl> self, const std::string& v) {
+                       self->set_protocol(v);
+                   })
+                   .getter("host", [](qjs::This<UrlImpl> self) { return self->host(); })
+                   .setter("host", [](qjs::This<UrlImpl> self, const std::string& v) {
+                       self->set_host(v);
+                   })
+                   .getter("hostname", [](qjs::This<UrlImpl> self) { return self->hostname(); })
+                   .setter("hostname", [](qjs::This<UrlImpl> self, const std::string& v) {
+                       self->set_hostname(v);
+                   })
+                   .getter("port", [](qjs::This<UrlImpl> self) { return self->port(); })
+                   .setter("port", [](qjs::This<UrlImpl> self, const std::string& v) {
+                       self->set_port(v);
+                   })
+                   .getter("pathname", [](qjs::This<UrlImpl> self) { return self->pathname(); })
+                   .setter("pathname", [](qjs::This<UrlImpl> self, const std::string& v) {
+                       self->set_pathname(v);
+                   })
+                   .getter("search", [](qjs::This<UrlImpl> self) { return self->search(); })
+                   .setter("search", [](qjs::This<UrlImpl> self, const std::string& v) {
+                       self->set_search(v);
+                   })
+                   .getter("hash", [](qjs::This<UrlImpl> self) { return self->hash(); })
+                   .setter("hash", [](qjs::This<UrlImpl> self, const std::string& v) {
+                       self->set_hash(v);
+                   })
+                   .getter("origin", [](qjs::This<UrlImpl> self) { return self->origin(); })
+                   .getter("searchParams",
+                           [](qjs::Ctx ctx, qjs::This<UrlImpl> self) -> qjs::Value {
+                               // v1：从当前 search 重新解析，不回写
+                               UrlSearchParamsImpl p =
+                                   UrlSearchParamsImpl::from_query(self->search());
+                               return qjs::Value(
+                                   ctx.ctx, qjs::js_convert<UrlSearchParamsImpl>::to_js(ctx.ctx, p));
+                           })
+                   .method("toString", [](qjs::This<UrlImpl> self) { return self->to_string(); })
+                   .method("toJSON", [](qjs::This<UrlImpl> self) { return self->to_string(); });
+
+    // v1 不做 Symbol.iterator 补丁（entries/keys/values 返回数组已满足 fetch 场景；
+    // 注意：不可用 ctx.eval 做原型补丁——异常会污染 current_exception）
+    ctx.globals().set("URL", cls.constructor_function());
+}
+
+} // namespace qjsbind::web

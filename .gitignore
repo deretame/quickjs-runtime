@@ -34,3 +34,7 @@ NUL.obj
 # 临时文件
 *.log
 *.tmp
+
+# 构建产物
+src/net/cacert_embedded.hpp
+third_party/wpt/

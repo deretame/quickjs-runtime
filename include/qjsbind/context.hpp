@@ -81,7 +81,8 @@ public:
         names_.emplace(typeid(T), name);
         // JS_NewClass 同样保存 class_def 指针（实测：传局部 def 会在 FreeRuntime 时悬垂崩溃）
         // → def 也存入 registry（map 节点稳定），生命周期 = registry 生命周期
-        JSClassDef def{names_.at(typeid(T)).c_str(), &class_finalizer<T>, nullptr, nullptr, nullptr};
+        JSClassDef def{names_.at(typeid(T)).c_str(), &class_finalizer<T>, &class_mark<T>,
+                       nullptr, nullptr};
         defs_.emplace(typeid(T), def);
         JS_NewClass(JS_GetRuntime(ctx), id, &defs_.at(typeid(T)));
         ids_.emplace(typeid(T), id);
@@ -119,6 +120,11 @@ public:
     // finalizer：定义在 Runtime 完整之后（context.hpp 底部，见下）
     template <class T>
     static void class_finalizer(JSRuntime* rt, JSValueConst obj);
+    // gc_mark：定义在 Runtime 完整之后（context.hpp 底部，见下）。
+    // 扩展点：T 可定义 void qjs_mark(JSRuntime*, JS_MarkFunc*) 标记 opaque 内的 JSValue
+    // 引用（如监听器/缓存对象），否则 GC 会把它们误判为不可达而提前回收。
+    template <class T>
+    static void class_mark(JSRuntime* rt, JSValueConst val, JS_MarkFunc* mark_func);
 
     std::map<std::type_index, JSClassID> ids_;     // 节点稳定（class id 查找）
     std::map<std::type_index, std::string> names_; // class_name 生命周期 = registry 生命周期
@@ -162,6 +168,11 @@ public:
         // 兜底关闭：取消在飞任务并驱动到空（协作式；正常流程经 stop() → run() 已 shutdown）
         if (pending_.load(std::memory_order_acquire) != 0)
             shutdown();
+        // 显式 GC：opaque 的 finalizer 在 ctx 存活期执行（opaque 内的
+        // RtValue/JSValue 成员可安全释放；否则惰性 GC 会让它们泄漏到
+        // JS_FreeRuntime 的 debug assert）。仍可达对象在 FreeContext 后
+        // 引用归零释放，FreeRuntime 时 gc 列表为空。
+        JS_RunGC(rt_);
         JS_FreeContext(ctx_);
         JS_FreeRuntime(rt_); // 类 finalizer 在此运行；registry_ 成员仍存活
         if (tls_current_runtime == this)
@@ -247,7 +258,7 @@ inline class_registry& Context::registry() const
     return runtime_of(ctx_).registry();
 }
 
-// ---- class_finalizer 定义（Runtime 已完整）----
+// ---- class_finalizer / class_mark 定义（Runtime 已完整）----
 // finalizer 无 ctx（quickjs.h:654），从 runtime opaque（Runtime*）反查注册表拿 class id
 template <class T>
 void class_registry::class_finalizer(JSRuntime* rt, JSValueConst obj)
@@ -261,6 +272,22 @@ void class_registry::class_finalizer(JSRuntime* rt, JSValueConst obj)
         return;
     T* p = static_cast<T*>(JS_GetOpaque(obj, it->second));
     delete p;
+}
+
+// gc_mark：若 T 定义 qjs_mark(JSRuntime*, JS_MarkFunc*)，标记 opaque 内的 JSValue 引用
+template <class T>
+void class_registry::class_mark(JSRuntime* rt, JSValueConst val, JS_MarkFunc* mark_func)
+{
+    auto* runtime = static_cast<Runtime*>(JS_GetRuntimeOpaque(rt));
+    if (!runtime)
+        return;
+    auto& reg = runtime->registry();
+    auto it = reg.ids_.find(typeid(T));
+    if (it == reg.ids_.end())
+        return;
+    T* p = static_cast<T*>(JS_GetOpaque(val, it->second));
+    if constexpr (requires(T& t) { t.qjs_mark(rt, mark_func); })
+        p->qjs_mark(rt, mark_func);
 }
 
 } // namespace qjs

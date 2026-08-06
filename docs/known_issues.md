@@ -249,3 +249,43 @@
 | 不能分配常量大小为 0 的数组 | 空参数包 → 零长数组 | KI-005 |
 | lambda 被 static_assert "M1 暂不支持成员函数指针" | lambda operator() 提取误判 is_member | （function_traits 主模板显式置 false） |
 | Opt/Rest 参数错位（Ctx 不消耗 argv） | argv 游标用了参数索引 | （arity_info::offsets 编译期计算） |
+
+## 50+ fetch / wpt 里程碑（2026-08-07 记录）
+
+### KI-050 ● 批量替换 JS_ThrowTypeError 时 throw 脱离 if 控制流
+- **现象**：`HeadersInvalidName` 返回 `"undefined"`；多个测试 eval 无条件异常。
+- **原因**：脚本把 `if (cond) JS_ThrowTypeError(...);` 单语句替换成两行组合时，`throw qjs::js_error(...)` 落到了 if 外（无条件执行，包装 `JS_UNINITIALIZED` 伪异常）。
+- **规避**：web 层统一走 `errors.hpp::throw_type_error`（`[[noreturn]]` 单语句，不可能被控制流拆散）。
+- **状态**：已规避（wpt 30/30 验证）。
+
+### KI-051 ★ MSVC 协程异常传播对 move-only 异常类型损坏
+- **现象**：exec::task 协程体抛 `js_error`（move-only）→ SEH 0xc0000005（崩溃点在 throw 语句展开）。
+- **原因**：MSVC 的异常对象存储/展开与协程帧的交互缺陷（`std::runtime_error` 可拷贝则正常，对照实验证实）。
+- **规避**：`qjs::js_error` 加拷贝构造（`JS_DupValue` 深拷贝语义）。
+- **状态**：已规避（ResponseConsume 全绿）。
+
+### KI-052 ● `parse_uri_reference` 的 url_view 借用输入字符串
+- **现象**：宽松解析（relax_url_chars）后 `result<url_view>` 悬垂 → boost 断言失败/崩溃（Debug 构建表现为弹窗挂起）。
+- **原因**：url_view 不拥有字符串；relax 临时 `std::string` 在 if 块内析构。
+- **规避**：relax 结果提升到函数作用域（`relaxed_storage`），url_view 使用完再销毁。
+- **状态**：已规避。
+
+### KI-053 ● JS 侧补丁字符串禁止 `//` 行注释
+- **现象**：Headers 迭代器补丁"部分生效"（entries/keys/values 未覆盖，forEach 抛 ReferenceError）。
+- **原因**：C++ 字符串拼接无换行，`//` 注释吞掉后续全部代码。
+- **规避**：补丁字符串只用 `/* */` 或不用注释。
+- **状态**：已规避。
+
+### KI-054 ● Windows 环境隐形坑（fetch 里程碑实测）
+- `std::ifstream` 打不开混合分隔符路径（`D:\...untime/third_party/...`，errno=22）→ 用 `std::fopen`
+- Windows 被拒端口（127.0.0.1:1 等）静默丢包，connect 挂起 → 必须实现 blocked-port 构造检查（fetch 规范）
+- python `open("w")` 在 Windows 写 CRLF → `std::getline` 残留 `\r` 污染 meta 路径 → 写清单用 `newline="
+"` + 解析端防御 strip
+- **状态**：已规避（wpt_runner/analyze_wpt.py/http_client 均含规避代码）。
+
+### KI-055 ○ wpt 精选子集 9 个 expected（v1 已知限制）
+- 活迭代器语义（迭代中删除/追加元素）6 个：v1 迭代器是快照（JS 补丁基于 entries 数组）
+- 裸 `%` 在 query 的 WHATWG 保留语义（boost 无法表示）
+- `data:` URL 的 fetch 未实现
+- Headers 实例构造走内部拷贝（不走自定义迭代器）
+- **状态**：设计规避（shim 内登记 expected，套件保持 0 fail）。

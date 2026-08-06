@@ -17,13 +17,18 @@ inline std::string utf16_to_utf8(const uint16_t* units, size_t len) {
     size_t i = 0;
     while (i < len) {
         uint32_t cp = units[i];
-        if (cp >= 0xD800 && cp <= 0xDBFF && i + 1 < len) {
-            const uint32_t lo = units[i + 1];
-            if (lo >= 0xDC00 && lo <= 0xDFFF) {
-                cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
-                ++i;
+        if (cp >= 0xD800 && cp <= 0xDBFF) {
+            // 高代理：必须紧跟低代理，否则孤立 → U+FFFD
+            if (i + 1 < len) {
+                const uint32_t lo = units[i + 1];
+                if (lo >= 0xDC00 && lo <= 0xDFFF) {
+                    cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                    ++i;
+                } else {
+                    cp = 0xFFFD; // 孤立高代理（后随非低代理）
+                }
             } else {
-                cp = 0xFFFD; // 孤立高代理
+                cp = 0xFFFD; // 孤立高代理（末尾）
             }
         } else if (cp >= 0xDC00 && cp <= 0xDFFF) {
             cp = 0xFFFD; // 孤立低代理

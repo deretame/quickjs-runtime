@@ -183,4 +183,56 @@ TEST_F(FetchFixture, ResponseErrorAndRedirect)
     EXPECT_EQ(r.as<std::string>(), "error|302|http://x/y");
 }
 
+TEST_F(FetchFixture, HeaderMethodOverride)
+{
+    Value r = ctx.eval(
+        "var r = new Request('https://site.example/');"
+        "r.headers.append('x-http-method-override', 'GETTRACE');"
+        "r.headers.get('x-http-method-override') + '|' + r.headers.has('x-http-method-override');");
+    ASSERT_FALSE(r.is_exception());
+    EXPECT_EQ(r.as<std::string>(), "GETTRACE|true");
+}
+
+TEST_F(FetchFixture, DebugIterProto)
+{
+    Value r = ctx.eval(
+        "var out = [];"
+        "function t(name, f) { try { f(); out.push(name + ':ok'); } catch (e) { out.push(name + ':FAIL ' + e); } }"
+        "t('v1', function () { var p = Object.create(Object.getPrototypeOf(Object.getPrototypeOf([].values()))); });"
+        "t('v2', function () { var p = Object.create(Object.getPrototypeOf(Object.getPrototypeOf([][Symbol.iterator]()))); });"
+        "t('v3', function () { var hs = Headers.prototype; var e0 = hs.entries; e0.call(new Headers()); });"
+        "t('v4', function () { var hs = Headers.prototype; var f0 = hs.forEach; typeof f0; });"
+        "t('v5', function () { var p = Object.create(Object.getPrototypeOf(Object.getPrototypeOf([].values()))); p.next = function(){}; });"
+        "out.join('\\n');");
+    ASSERT_FALSE(r.is_exception());
+    std::fprintf(stderr, "ITER:\n%s\n", r.as<std::string>().c_str());
+}
+
+TEST_F(FetchFixture, RequestNonAsciiUrl)
+{
+    Value r = ctx.eval(
+        "var r = new Request('http://x/y?z=1|x', {headers: {'X-Test': 'before-ß-after'}});"
+        "r.url + '|' + r.headers.get('X-Test');");
+    ASSERT_FALSE(r.is_exception());
+    EXPECT_EQ(r.as<std::string>(), "http://x/y?z=1%7Cx|before-ß-after");
+}
+
+TEST_F(FetchFixture, RequestSurrogateUrl)
+{
+    ctx.eval("location = {href: 'http://x/url-encoding.html'}");
+    Value r = ctx.eval(
+        "var u1 = new URL('?\\uD83D', location.href).href;"
+        "var r1 = new Request('?\\uD83D').url;"
+        "u1 + '|' + r1;");
+    if (r.is_exception()) {
+        qjs::Value exc(ctx.raw(), JS_GetException(ctx.raw()));
+        const char* s = JS_ToCString(ctx.raw(), exc.raw());
+        std::fprintf(stderr, "EXC: %s\n", s ? s : "(null)");
+        if (s)
+            JS_FreeCString(ctx.raw(), s);
+    }
+    ASSERT_FALSE(r.is_exception());
+    EXPECT_EQ(r.as<std::string>(), "http://x/url-encoding.html?%EF%BF%BD|http://x/url-encoding.html?%EF%BF%BD");
+}
+
 } // namespace

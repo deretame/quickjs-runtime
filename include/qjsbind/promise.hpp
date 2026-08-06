@@ -25,8 +25,10 @@ inline JSValue exception_to_js(JSContext* ctx, std::exception_ptr e)
     try {
         std::rethrow_exception(e);
     } catch (const js_error& je) {
-        // 透传原本的 JS 异常值（dup 一份给调用方 free）
-        return JS_DupValue(ctx, je.release_value());
+        // 透传原本的 JS 异常值：release_value 已把所有权交给调用方（调用方 free）。
+        // 不能 JS_DupValue——会多一份引用，异常对象析构时已 released_ 不再 free，
+        // 导致 JSValue 引用计数泄漏（Runtime 析构断言 gc_obj_list 非空）。
+        return je.release_value();
     } catch (const std::exception& ex) {
         return JS_NewInternalError(ctx, "%s", ex.what());
     } catch (...) {

@@ -56,12 +56,17 @@ pixi run build
 ├── docs/                   # 使用指南（P2300 执行器模型）
 ├── scripts/                # Python 脚本（pixi run 调用）
 │   ├── bootstrap_vcpkg.py  # 克隆 + bootstrap vcpkg
+│   ├── bootstrap_cacert.py # 下载 Mozilla CA bundle（fetch 网络层证书）
+│   ├── add_bom.py          # 给 web 层头文件加 UTF-8 BOM（MSVC GBK 兼容）
+│   ├── analyze_wpt.py      # wpt 精选子集清单生成
 │   ├── vs_env.py           # 定位 MSVC 环境（vswhere + vcvars64）
 │   ├── configure.py        # CMake 配置
 │   ├── build.py            # 构建
 │   └── test.py             # ctest
-├── src/main.cpp            # 主程序（quickjs-ng + asio + stdexec demo）
-└── tests/                  # gtest 测试（28 个用例）
+├── src/
+│   ├── main.cpp            # 主程序（quickjs-ng + asio + stdexec demo）
+│   └── net/                # fetch 网络层（boost::beast + OpenSSL，静态库 qjsbind_net）
+└── tests/                  # gtest 测试（89 个用例 + wpt 精选子集运行器）
 ```
 
 ## 依赖

@@ -10,8 +10,11 @@
 #include <qjsbind/rt_value.hpp>
 #include <qjsbind/value.hpp>
 #include <qjsbind/web/abort.hpp>
+#include <qjsbind/web/errors.hpp>
 #include <qjsbind/web/headers.hpp>
 #include <qjsbind/web/url.hpp>
+
+#include <exec/task.hpp>
 
 #include <optional>
 #include <string>
@@ -62,13 +65,17 @@ inline ExtractedBody extract_body(JSContext* ctx, JSValueConst body) {
         out.bytes = js_bytes_from(ctx, body);
         return out;
     }
-    JS_Throw(ctx, JS_NewTypeError(ctx, "body: 不支持的 body 类型"));
-    throw qjs::js_error(ctx, JS_GetException(ctx));
+    throw_type_error(ctx, "body: 不支持的 body 类型");
 }
 
 // 消费字节：text / json / arrayBuffer
 inline qjs::Value consume_text(JSContext* ctx, const std::string& bytes) {
-    return qjs::Value(ctx, JS_NewStringLen(ctx, bytes.data(), bytes.size()));
+    // 规范：text() 走 UTF-8 decode（剥离 BOM，与 TextDecoder 默认一致；wpt 测试权威）
+    std::string s = bytes;
+    if (s.size() >= 3 && static_cast<uint8_t>(s[0]) == 0xEF &&
+        static_cast<uint8_t>(s[1]) == 0xBB && static_cast<uint8_t>(s[2]) == 0xBF)
+        s.erase(0, 3);
+    return qjs::Value(ctx, JS_NewStringLen(ctx, s.data(), s.size()));
 }
 inline qjs::Value consume_json(JSContext* ctx, const std::string& bytes) {
     JSValue v = JS_ParseJSON(ctx, bytes.data(), bytes.size(), "<json>");
@@ -85,11 +92,20 @@ inline qjs::Value consume_array_buffer(JSContext* ctx, const std::string& bytes)
 template <class Self, class Fn>
 qjs::Value consume_impl(JSContext* ctx, Self& self, const char* what, Fn&& fn) {
     if (self.body_used)
-        JS_Throw(ctx, JS_NewTypeError(ctx, "%s: body 已被消费", what));
-    throw qjs::js_error(ctx, JS_GetException(ctx));
+        throw_type_error(ctx, "%s: body 已被消费", what);
     self.body_used = true;
     return fn(ctx, self.body_bytes);
 }
+
+// 解析 URL 的端口并做 blocked 检查（定义见 RequestImpl 之后；类内方法先声明）
+inline void check_url_ports(JSContext* ctx, const std::string& url);
+
+// 前向声明（RequestImpl::qjs_init 的 init.body 需检查 Response 实例）
+struct ResponseImpl;
+
+// init.body 是 Request/Response 实例时复制其内部 body（bodyUsed → TypeError）。
+// 定义见 ResponseImpl 之后（需完整类型）；RequestImpl::qjs_init 里调用。
+inline bool try_extract_init_body(JSContext* ctx, JSValueConst v, ExtractedBody& out);
 
 // ---------- Request ----------
 
@@ -103,6 +119,7 @@ struct RequestImpl {
     std::string redirect = "follow";
     AbortSignalImpl* signal = nullptr; // 借用（signal JS 对象持有）
     qjs::RtValue signal_js;            // 持有 signal JS 引用（fetch 取消用）
+    qjs::RtValue headers_js;           // 缓存的 Headers JS 对象（同一对象语义）
 
     RequestImpl() = default;
     // 拷贝：signal 不复制（fetch 规范：Request clone 不继承 signal）
@@ -119,7 +136,24 @@ struct RequestImpl {
         redirect = o.redirect;
         signal = nullptr;
         signal_js = qjs::RtValue(); // 释放旧引用（若有）
+        headers_js = qjs::RtValue();
         return *this;
+    }
+
+    // 从缓存的 Headers JS 对象同步回数据（用户可能通过 r.headers 修改过）
+    void sync_headers(JSContext* ctx) {
+        if (!headers_js.empty()) {
+            const auto* h = qjs::registry_of(ctx).opaque<HeadersImpl>(ctx, headers_js.dup(ctx));
+            if (h)
+                headers = *h;
+        }
+    }
+    // Headers getter 缓存实现（同一对象语义，wpt 要求）
+    qjs::Value headers_value(qjs::Ctx ctx, qjs::This<RequestImpl> self) {
+        if (self->headers_js.empty())
+            self->headers_js = qjs::RtValue(JS_GetRuntime(ctx.ctx),
+                                            qjs::js_convert<HeadersImpl>::to_js(ctx.ctx, self->headers));
+        return qjs::Value(ctx.ctx, self->headers_js.dup(ctx.ctx));
     }
 
     void qjs_init(JSContext* ctx, qjs::Opt<qjs::Value> input, qjs::Opt<qjs::Value> init) {
@@ -135,15 +169,15 @@ struct RequestImpl {
                     url = url_string_of(ctx, input->raw());
                 }
             } else if (input->is_string()) {
-                url = resolve_url(ctx, input->as<std::string>());
+                // 走 url_string_of：UTF-16 单元转 UTF-8（孤立代理 → U+FFFD）
+                url = url_string_of(ctx, input->raw());
             } else {
-                JS_Throw(ctx, JS_NewTypeError(ctx, "Request: input 类型不支持"));
-    throw qjs::js_error(ctx, JS_GetException(ctx));
+                throw_type_error(ctx, "Request: input 类型不支持");
             }
         } else {
-            JS_Throw(ctx, JS_NewTypeError(ctx, "Request: 缺少 input"));
-    throw qjs::js_error(ctx, JS_GetException(ctx));
+            throw_type_error(ctx, "Request: 缺少 input");
         }
+        check_url_ports(ctx, url); // fetch 规范 #port-blocking
         headers.set_guard(HeadersImpl::Guard::Request);
         if (signal)
             signal = nullptr; // 拷贝 input 时不继承 signal（规范：signal 不复制）
@@ -151,6 +185,15 @@ struct RequestImpl {
         // 2. init
         if (init && init->is_object()) {
             qjs::Object obj(*init);
+            // init 本身是 Request/Response 实例（new Request(url, req)）：复制其内部 body
+            ExtractedBody init_body;
+            if (try_extract_init_body(ctx, init->raw(), init_body)) {
+                body_bytes = std::move(init_body.bytes);
+                has_body = init_body.has;
+                body_used = false;
+                if (!init_body.content_type.empty())
+                    headers.append(ctx, "Content-Type", init_body.content_type);
+            }
             qjs::Value method = obj.get("method");
             if (!method.is_undefined())
                 this->method = normalize_method(ctx, method.as<std::string>());
@@ -161,15 +204,24 @@ struct RequestImpl {
             }
             qjs::Value body = obj.get("body");
             if (!body.is_undefined() && !body.is_null()) {
-                ExtractedBody b = extract_body(ctx, body.raw());
+                ExtractedBody b;
+                // init 是 Request/Response 实例时 body getter 返回 null（v1 无流），
+                // 但规范要求复制其内部 body（bodyUsed → TypeError）
+                if (!try_extract_init_body(ctx, body.raw(), b))
+                    b = extract_body(ctx, body.raw());
                 body_bytes = std::move(b.bytes);
                 has_body = b.has;
+                body_used = false; // 覆盖后重置（input 拷贝可能已消费）
                 if (!b.content_type.empty())
                     headers.append(ctx, "Content-Type", b.content_type);
             }
             qjs::Value redirect = obj.get("redirect");
             if (!redirect.is_undefined())
                 this->redirect = normalize_redirect(ctx, redirect.as<std::string>());
+            qjs::Value integrity = obj.get("integrity");
+            if (!integrity.is_undefined() && !integrity.is_null() &&
+                !integrity.as<std::string>().empty())
+                throw_type_error(ctx, "Request: integrity 未实现");
             qjs::Value signal_v = obj.get("signal");
             if (!signal_v.is_undefined() && !signal_v.is_null()) {
                 auto& reg = qjs::registry_of(ctx);
@@ -178,47 +230,84 @@ struct RequestImpl {
                     signal = reg.opaque<AbortSignalImpl>(ctx, signal_v.raw());
                     signal_js = qjs::RtValue(JS_GetRuntime(ctx), JS_DupValue(ctx, signal_v.raw()));
                 } else {
-                    JS_Throw(ctx, JS_NewTypeError(ctx, "Request: signal 类型不支持"));
-    throw qjs::js_error(ctx, JS_GetException(ctx));
+                    throw_type_error(ctx, "Request: signal 类型不支持");
                 }
             }
         }
         // GET/HEAD 带 body → TypeError（fetch 规范）
         if (has_body && (method == "GET" || method == "HEAD"))
-            JS_Throw(ctx, JS_NewTypeError(ctx, "Request: GET/HEAD 不能带 body"));
-    throw qjs::js_error(ctx, JS_GetException(ctx));
+            throw_type_error(ctx, "Request: GET/HEAD 不能带 body");
     }
 
     static std::string normalize_method(JSContext* ctx, std::string m) {
         for (auto& c : m)
             c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
         if (m.empty())
-            JS_Throw(ctx, JS_NewTypeError(ctx, "Request: method 为空"));
-    throw qjs::js_error(ctx, JS_GetException(ctx));
+            throw_type_error(ctx, "Request: method 为空");
         return m;
     }
     static std::string normalize_redirect(JSContext* ctx, const std::string& r) {
         if (r != "follow" && r != "error" && r != "manual")
-            JS_Throw(ctx, JS_NewTypeError(ctx, "Request: redirect 非法"));
-    throw qjs::js_error(ctx, JS_GetException(ctx));
+            throw_type_error(ctx, "Request: redirect 非法");
         return r;
     }
     // GC 标记：signal 对象引用
-    void qjs_mark(JSRuntime* rt, JS_MarkFunc* mark_func) { signal_js.mark(rt, mark_func); }
+    void qjs_mark(JSRuntime* rt, JS_MarkFunc* mark_func) {
+        signal_js.mark(rt, mark_func);
+        headers_js.mark(rt, mark_func);
+    }
 
     static std::string url_string_of(JSContext* ctx, JSValueConst v);
     static std::string resolve_url(JSContext* ctx, const std::string& str);
 };
+
+// fetch 规范 #port-blocking：Request URL 的端口在列表内 → 构造时 TypeError
+inline bool is_blocked_port(int port) {
+    static const int kBad[] = {
+        0, 1, 7, 9, 11, 13, 15, 17, 19, 20, 21, 22, 23, 25, 37, 42, 43, 53, 69,
+        77, 79, 87, 95, 101, 102, 103, 104, 109, 110, 111, 113, 115, 117, 119,
+        123, 135, 137, 139, 143, 161, 179, 389, 427, 465, 512, 513, 514, 515,
+        526, 530, 531, 532, 540, 548, 554, 556, 563, 587, 601, 636, 989, 990,
+        993, 995, 1719, 1720, 1723, 2049, 3659, 4045, 4190, 5060, 5061, 6000,
+        6566, 6665, 6666, 6667, 6668, 6669, 6679, 6697, 10080,
+    };
+    for (int b : kBad)
+        if (port == b)
+            return true;
+    return false;
+}
+
+// 解析 URL 的端口并做 blocked 检查（绝对 URL 字符串）
+inline void check_url_ports(JSContext* ctx, const std::string& url) {
+    auto r = boost::urls::parse_uri_reference(url);
+    if (r.has_error())
+        return; // 解析失败由 URL 层抛
+    if (r->has_port()) {
+        try {
+            const int p = std::stoi(std::string(r->port()));
+            if (is_blocked_port(p))
+                throw_type_error(ctx, "Request: URL 端口 %d 被禁止", p);
+        } catch (const std::invalid_argument&) {
+            return;
+        }
+    }
+}
 
 // URL 实例 → 序列化；相对字符串 → location.href 为 base 解析
 inline std::string RequestImpl::url_string_of(JSContext* ctx, JSValueConst v) {
     auto& reg = qjs::registry_of(ctx);
     if (reg.is_registered<UrlImpl>() && reg.id_of<UrlImpl>(ctx) == JS_GetClassID(v))
         return reg.opaque<UrlImpl>(ctx, v)->href();
-    if (JS_IsString(v))
-        return resolve_url(ctx, std::string(JS_ToCString(ctx, v)));
-    JS_Throw(ctx, JS_NewTypeError(ctx, "Request: input 类型不支持"));
-    throw qjs::js_error(ctx, JS_GetException(ctx));
+    if (JS_IsString(v)) {
+        // UTF-16 单元转 UTF-8（孤立代理 → U+FFFD，与 WHATWG URL 编码一致）
+        size_t len = 0;
+        const uint16_t* units = JS_ToCStringLenUTF16(ctx, &len, v);
+        std::string s = units ? utf16_to_utf8(units, len) : std::string{};
+        if (units)
+            JS_FreeCStringUTF16(ctx, units);
+        return resolve_url(ctx, std::move(s));
+    }
+    throw_type_error(ctx, "Request: input 类型不支持");
 }
 
 inline std::string RequestImpl::resolve_url(JSContext* ctx, const std::string& str) {
@@ -248,10 +337,12 @@ inline void install_request(qjs::Context& ctx) {
                    .constructor<qjs::Opt<qjs::Value>, qjs::Opt<qjs::Value>>()
                    .getter("method", [](qjs::This<RequestImpl> self) { return self->method; })
                    .getter("url", [](qjs::This<RequestImpl> self) { return self->url; })
-                   .getter("headers", [](qjs::Ctx ctx, qjs::This<RequestImpl> self) -> qjs::Value {
-                       return qjs::Value(ctx.ctx, qjs::js_convert<HeadersImpl>::to_js(ctx.ctx, self->headers));
-                   })
+                   .getter("headers", &RequestImpl::headers_value)
                    .getter("bodyUsed", [](qjs::This<RequestImpl> self) { return self->body_used; })
+                   .getter("body", [](qjs::Ctx ctx, qjs::This<RequestImpl>) -> qjs::Value {
+                       // v1 无 ReadableStream：body 恒为 null（规范允许 null 或流）
+                       return qjs::Value(ctx.ctx, JS_NULL);
+                   })
                    .getter("redirect", [](qjs::This<RequestImpl> self) { return self->redirect; })
                    .getter("signal", [](qjs::Ctx ctx, qjs::This<RequestImpl> self) -> qjs::Value {
                        if (self->signal_js.empty())
@@ -260,18 +351,20 @@ inline void install_request(qjs::Context& ctx) {
                    })
                    .method("clone", [](qjs::Ctx ctx, qjs::This<RequestImpl> self) -> qjs::Value {
                        if (self->body_used)
-                           throw qjs::js_error(ctx.ctx,
-                                               JS_Throw(ctx.ctx, JS_NewTypeError(ctx.ctx, "Request: body 已被消费")));
+                           throw_type_error(ctx.ctx, "Request: body 已被消费");
                        return qjs::Value(ctx.ctx, qjs::js_convert<RequestImpl>::to_js(ctx.ctx, *self));
                    })
-                   .method("text", [](qjs::Ctx ctx, qjs::This<RequestImpl> self) -> qjs::Value {
-                       return consume_impl(ctx.ctx, *self, "Request", consume_text);
+                   .method("text", [](qjs::Ctx ctx, qjs::This<RequestImpl> self)
+                               -> exec::task<qjs::Value> {
+                       co_return consume_impl(ctx.ctx, *self, "Request", consume_text);
                    })
-                   .method("json", [](qjs::Ctx ctx, qjs::This<RequestImpl> self) -> qjs::Value {
-                       return consume_impl(ctx.ctx, *self, "Request", consume_json);
+                   .method("json", [](qjs::Ctx ctx, qjs::This<RequestImpl> self)
+                               -> exec::task<qjs::Value> {
+                       co_return consume_impl(ctx.ctx, *self, "Request", consume_json);
                    })
-                   .method("arrayBuffer", [](qjs::Ctx ctx, qjs::This<RequestImpl> self) -> qjs::Value {
-                       return consume_impl(ctx.ctx, *self, "Request", consume_array_buffer);
+                   .method("arrayBuffer", [](qjs::Ctx ctx, qjs::This<RequestImpl> self)
+                               -> exec::task<qjs::Value> {
+                       co_return consume_impl(ctx.ctx, *self, "Request", consume_array_buffer);
                    });
     ctx.globals().set("Request", cls.constructor_function());
 }
@@ -288,6 +381,32 @@ struct ResponseImpl {
     std::string type = "default";
     std::string url;
     bool redirected = false;
+    qjs::RtValue headers_js; // 缓存的 Headers JS 对象（同一对象语义）
+
+    ResponseImpl() = default;
+    // 拷贝：headers_js 缓存不复制（to_js/clone 场景）
+    ResponseImpl(const ResponseImpl& o)
+        : status(o.status), status_text(o.status_text), headers(o.headers),
+          body_bytes(o.body_bytes), has_body(o.has_body), body_used(o.body_used),
+          type(o.type), url(o.url), redirected(o.redirected)
+    {
+    }
+    ResponseImpl& operator=(const ResponseImpl& o)
+    {
+        status = o.status;
+        status_text = o.status_text;
+        headers = o.headers;
+        body_bytes = o.body_bytes;
+        has_body = o.has_body;
+        body_used = o.body_used;
+        type = o.type;
+        url = o.url;
+        redirected = o.redirected;
+        headers_js = qjs::RtValue();
+        return *this;
+    }
+
+    void qjs_mark(JSRuntime* rt, JS_MarkFunc* mark_func) { headers_js.mark(rt, mark_func); }
 
     void qjs_init(JSContext* ctx, qjs::Opt<qjs::Value> body, qjs::Opt<qjs::Value> init) {
         headers.set_guard(HeadersImpl::Guard::Response);
@@ -296,18 +415,32 @@ struct ResponseImpl {
             qjs::Value status_v = obj.get("status");
             if (!status_v.is_undefined()) {
                 const int s = status_v.as<int>();
+                // 规范：状态码范围违规 → RangeError（wpt 要求 instanceof RangeError）
                 if (s < 200 || s > 599)
-                    JS_Throw(ctx, JS_NewTypeError(ctx, "Response: status 必须在 200-599"));
-    throw qjs::js_error(ctx, JS_GetException(ctx));
+                    throw_range_error(ctx, "Response: status 必须在 200-599");
                 status = s;
             }
             qjs::Value st = obj.get("statusText");
             if (!st.is_undefined())
                 status_text = st.as<std::string>();
+            // 规范：statusText 必须 HTTP reason-phrase（ByteString：代码点 ≤ U+00FF；
+            // CR/LF 禁；0x80-0xFF obs-text 允许）
             for (const char c : status_text)
                 if (c == '\r' || c == '\n')
-                    throw qjs::js_error(ctx,
-                                        JS_Throw(ctx, JS_NewTypeError(ctx, "Response: statusText 含 CR/LF")));
+                    throw_type_error(ctx, "Response: statusText 含 CR/LF");
+            {
+                const std::string& s = status_text;
+                for (auto it = s.begin(); it != s.end();) {
+                    uint32_t cp = 0;
+                    try {
+                        cp = utf8::next(it, s.end());
+                    } catch (...) {
+                        throw_type_error(ctx, "Response: statusText 非 UTF-8");
+                    }
+                    if (cp > 0xFF)
+                        throw_type_error(ctx, "Response: statusText 代码点超出 ByteString 范围");
+                }
+            }
             qjs::Value hdrs = obj.get("headers");
             if (!hdrs.is_undefined() && !hdrs.is_null()) {
                 headers = headers_from(ctx, hdrs.raw());
@@ -315,6 +448,9 @@ struct ResponseImpl {
             }
         }
         if (body && !body->is_undefined() && !body->is_null()) {
+            // 规范：204/205/304 带 body → TypeError
+            if (status == 204 || status == 205 || status == 304)
+                throw_type_error(ctx, "Response: 204/205/304 不能带 body");
             ExtractedBody b = extract_body(ctx, body->raw());
             body_bytes = std::move(b.bytes);
             has_body = b.has;
@@ -327,6 +463,28 @@ struct ResponseImpl {
     bool ok() const { return status >= 200 && status <= 299; }
 };
 
+// init.body 是 Request/Response 实例时复制其内部 body（bodyUsed → TypeError）
+inline bool try_extract_init_body(JSContext* ctx, JSValueConst v, ExtractedBody& out) {
+    auto& reg = qjs::registry_of(ctx);
+    if (reg.is_registered<RequestImpl>() && reg.id_of<RequestImpl>(ctx) == JS_GetClassID(v)) {
+        auto* r = reg.opaque<RequestImpl>(ctx, v);
+        if (r->body_used)
+            throw_type_error(ctx, "Request: body 已被消费");
+        out.bytes = r->body_bytes;
+        out.has = r->has_body;
+        return true;
+    }
+    if (reg.is_registered<ResponseImpl>() && reg.id_of<ResponseImpl>(ctx) == JS_GetClassID(v)) {
+        auto* r = reg.opaque<ResponseImpl>(ctx, v);
+        if (r->body_used)
+            throw_type_error(ctx, "Response: body 已被消费");
+        out.bytes = r->body_bytes;
+        out.has = r->has_body;
+        return true;
+    }
+    return false;
+}
+
 inline void install_response(qjs::Context& ctx) {
     auto cls = qjs::class_<ResponseImpl>(ctx, "Response")
                    .constructor<qjs::Opt<qjs::Value>, qjs::Opt<qjs::Value>>()
@@ -337,43 +495,78 @@ inline void install_response(qjs::Context& ctx) {
                    .getter("url", [](qjs::This<ResponseImpl> self) { return self->url; })
                    .getter("redirected", [](qjs::This<ResponseImpl> self) { return self->redirected; })
                    .getter("headers", [](qjs::Ctx ctx, qjs::This<ResponseImpl> self) -> qjs::Value {
-                       return qjs::Value(ctx.ctx, qjs::js_convert<HeadersImpl>::to_js(ctx.ctx, self->headers));
+                       if (self->headers_js.empty())
+                           self->headers_js = qjs::RtValue(
+                               JS_GetRuntime(ctx.ctx),
+                               qjs::js_convert<HeadersImpl>::to_js(ctx.ctx, self->headers));
+                       return qjs::Value(ctx.ctx, self->headers_js.dup(ctx.ctx));
                    })
                    .getter("bodyUsed", [](qjs::This<ResponseImpl> self) { return self->body_used; })
+                   .getter("body", [](qjs::Ctx ctx, qjs::This<ResponseImpl>) -> qjs::Value {
+                       // v1 无 ReadableStream：body 恒为 null（204/205/304/HEAD 也是 null）
+                       return qjs::Value(ctx.ctx, JS_NULL);
+                   })
                    .method("clone", [](qjs::Ctx ctx, qjs::This<ResponseImpl> self) -> qjs::Value {
                        if (self->body_used)
-                           throw qjs::js_error(ctx.ctx,
-                                               JS_Throw(ctx.ctx, JS_NewTypeError(ctx.ctx, "Response: body 已被消费")));
+                           throw_type_error(ctx.ctx, "Response: body 已被消费");
                        return qjs::Value(ctx.ctx, qjs::js_convert<ResponseImpl>::to_js(ctx.ctx, *self));
                    })
-                   .method("text", [](qjs::Ctx ctx, qjs::This<ResponseImpl> self) -> qjs::Value {
-                       return consume_impl(ctx.ctx, *self, "Response", consume_text);
+                   .method("text", [](qjs::Ctx ctx, qjs::This<ResponseImpl> self)
+                               -> exec::task<qjs::Value> {
+                       co_return consume_impl(ctx.ctx, *self, "Response", consume_text);
                    })
-                   .method("json", [](qjs::Ctx ctx, qjs::This<ResponseImpl> self) -> qjs::Value {
-                       return consume_impl(ctx.ctx, *self, "Response", consume_json);
+                   .method("json", [](qjs::Ctx ctx, qjs::This<ResponseImpl> self)
+                               -> exec::task<qjs::Value> {
+                       co_return consume_impl(ctx.ctx, *self, "Response", consume_json);
                    })
-                   .method("arrayBuffer", [](qjs::Ctx ctx, qjs::This<ResponseImpl> self) -> qjs::Value {
-                       return consume_impl(ctx.ctx, *self, "Response", consume_array_buffer);
+                   .method("arrayBuffer", [](qjs::Ctx ctx, qjs::This<ResponseImpl> self)
+                               -> exec::task<qjs::Value> {
+                       co_return consume_impl(ctx.ctx, *self, "Response", consume_array_buffer);
                    })
                    .static_method("error", [](qjs::Ctx ctx) -> qjs::Value {
                        ResponseImpl r;
                        r.status = 0;
                        r.type = "error";
+                       r.headers.set_guard(HeadersImpl::Guard::Immutable); // 规范：error 响应 headers 不可变
                        return qjs::Value(ctx.ctx, qjs::js_convert<ResponseImpl>::to_js(ctx.ctx, r));
                    })
                    .static_method("redirect", [](qjs::Ctx ctx, const std::string& url,
                                                  qjs::Opt<int> status) -> qjs::Value {
                        const int s = status ? *status : 302;
                        if (s != 301 && s != 302 && s != 303 && s != 307 && s != 308)
-                           throw qjs::js_error(ctx.ctx,
-                                               JS_Throw(ctx.ctx, JS_NewTypeError(ctx.ctx, "Response: redirect 状态非法")));
+                           throw_range_error(ctx.ctx, "Response: redirect 状态非法");
                        ResponseImpl r;
                        r.status = s;
                        r.type = "default";
-                       r.headers.append(ctx.ctx, "Location", RequestImpl::resolve_url(ctx.ctx, url));
+                       r.headers.append_raw("location", RequestImpl::resolve_url(ctx.ctx, url));
                        return qjs::Value(ctx.ctx, qjs::js_convert<ResponseImpl>::to_js(ctx.ctx, r));
                    });
     ctx.globals().set("Response", cls.constructor_function());
+    // 迭代器对象（快照语义；活迭代器/删除语义不在 v1 范围）+ getSetCookie 已绑定
+    ctx.eval(
+        "var __hs = Headers.prototype;"
+        "var __e0 = __hs.entries, __k0 = __hs.keys, __v0 = __hs.values;"
+        "var __iterProto = Object.create(Object.getPrototypeOf(Object.getPrototypeOf([].values())));"
+        "__iterProto.next = function () {"
+        "  return this.__i < this.__arr.length"
+        "    ? {value: this.__arr[this.__i++], done: false}"
+        "    : {value: undefined, done: true};"
+        "};"
+        "__iterProto[Symbol.iterator] = function () { return this; };"
+        "function __mkIter(arr) {"
+        "  var it = Object.create(__iterProto);"
+        "  it.__arr = arr;"
+        "  it.__i = 0;"
+        "  return it;"
+        "}"
+        "__hs.entries = function () { return __mkIter(__e0.call(this)); };"
+        "__hs.keys = function () { return __mkIter(__k0.call(this)); };"
+        "__hs.values = function () { return __mkIter(__v0.call(this)); };"
+        "var __f0 = __hs.forEach;"
+        "__hs.forEach = function (cb, thisArg) {"
+        "  var self = this;"
+        "  __f0.call(this, function (value, key) { cb.call(thisArg, value, key, self); }, thisArg);"
+        "};");
 }
 
 } // namespace qjsbind::web

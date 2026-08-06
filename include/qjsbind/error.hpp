@@ -22,7 +22,9 @@ public:
         if (!released_ && ctx_)
             JS_FreeValue(ctx_, v_);
     }
-    js_error(const js_error&) = delete;
+    js_error(const js_error& o) : ctx_(o.ctx_), v_(o.ctx_ ? JS_DupValue(o.ctx_, o.v_) : JS_UNDEFINED)
+    {
+    }
     js_error& operator=(const js_error&) = delete;
     js_error(js_error&& o) noexcept : ctx_(o.ctx_), v_(o.v_), released_(o.released_)
     {

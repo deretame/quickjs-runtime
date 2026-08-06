@@ -71,6 +71,7 @@ add_executable(quickjs_runtime_tests
     tests/m3_binding_test.cpp
     tests/m4_binding_test.cpp
     tests/fetch_test.cpp
+    tests/wpt_runner.cpp
 )
 target_link_libraries(quickjs_runtime_tests PRIVATE
     qjs

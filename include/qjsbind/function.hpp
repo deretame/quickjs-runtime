@@ -110,6 +110,20 @@ struct js_convert<Opt<T>> {
     }
 };
 
+// 特化：Opt<Value> 保留 null（Headers(null) 需抛 TypeError 等场景；
+// undefined 仍表示"缺参"）。各 qjs_init 自行处理 null 语义。
+template <>
+struct js_convert<Opt<Value>> {
+    static Opt<Value> from_js(JSContext* ctx, JSValueConst v)
+    {
+        if (JS_IsUndefined(v))
+            return {};
+        Opt<Value> o;
+        o.value.emplace(ctx, JS_DupValue(ctx, v));
+        return o;
+    }
+};
+
 // 排空剩余参数
 template <class T>
 struct Rest {

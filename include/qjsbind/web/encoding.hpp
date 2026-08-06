@@ -7,6 +7,7 @@
 
 #include <qjsbind/class.hpp>
 #include <qjsbind/context.hpp>
+#include <qjsbind/web/errors.hpp>
 #include <qjsbind/web/utf8.hpp>
 
 #include <string>
@@ -22,6 +23,19 @@ struct TextDecoderImpl {
     bool ignore_bom = false;
 
     std::string encoding() const { return "utf-8"; }
+
+    // 构造 options：{fatal, ignoreBOM}（decode() 的 options 参数在方法内另读）
+    void qjs_init(JSContext* ctx, qjs::Opt<qjs::Value> options) {
+        if (options && options->is_object()) {
+            qjs::Object obj(*options);
+            qjs::Value fatal = obj.get("fatal");
+            if (!fatal.is_undefined())
+                this->fatal = fatal.as<bool>();
+            qjs::Value ignore_bom = obj.get("ignoreBOM");
+            if (!ignore_bom.is_undefined())
+                this->ignore_bom = ignore_bom.as<bool>();
+        }
+    }
 };
 
 // 从 JS 值提取字节（TypedArray/ArrayBuffer → 拷贝；其他 → TypeError）
@@ -43,8 +57,7 @@ inline std::string js_bytes_from(JSContext* ctx, JSValueConst v) {
         uint8_t* data = JS_GetArrayBuffer(ctx, &size, v);
         return std::string(reinterpret_cast<const char*>(data), size);
     }
-    JS_Throw(ctx, JS_NewTypeError(ctx, "TypeError: 参数不是字节数组"));
-    throw qjs::js_error(ctx, JS_GetException(ctx));
+    throw_type_error(ctx, "TypeError: 参数不是字节数组");
 }
 
 inline void install_text_encoder(qjs::Context& ctx) {
@@ -71,7 +84,7 @@ inline void install_text_encoder(qjs::Context& ctx) {
 
 inline void install_text_decoder(qjs::Context& ctx) {
     auto cls = qjs::class_<TextDecoderImpl>(ctx, "TextDecoder")
-                   .constructor<>()
+                   .constructor<qjs::Opt<qjs::Value>>()
                    .getter("encoding", [](qjs::This<TextDecoderImpl> self) { return self->encoding(); })
                    .method("decode",
                 [](qjs::Ctx ctx, qjs::This<TextDecoderImpl> self, qjs::Opt<qjs::Value> input,

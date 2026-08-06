@@ -10,6 +10,8 @@
 #include <qjsbind/class.hpp>
 #include <qjsbind/context.hpp>
 #include <qjsbind/value.hpp>
+#include <qjsbind/web/errors.hpp>
+#include <qjsbind/web/utf8.hpp>
 
 #include <algorithm>
 #include <cctype>
@@ -33,6 +35,12 @@ inline bool is_forbidden_request_header(const std::string& lower_name) {
         if (lower_name == f)
             return true;
     return lower_name.starts_with("proxy-") || lower_name.starts_with("sec-");
+}
+
+// method-override 头（值含 forbidden method 时整体忽略，见 forbidden()）
+inline bool is_method_override_header(const std::string& lower_name) {
+    return lower_name == "x-http-method-override" || lower_name == "x-http-method" ||
+           lower_name == "x-method-override";
 }
 
 inline bool is_forbidden_response_header(const std::string& lower_name) {
@@ -64,10 +72,12 @@ inline std::string trim_http_ws(std::string_view s) {
 }
 
 struct HeadersImpl {
-    enum class Guard { None, Request, RequestNoCors, Response };
+    enum class Guard { None, Request, RequestNoCors, Response, Immutable };
     Guard guard = Guard::None;
 
-    std::map<std::string, std::string> list; // lowercase name → 合并值
+    // list of (lowercase name, value)：保序 + 同名多值（set-cookie 语义）；
+    // get 合并；迭代 sort+combine（stable：同名保插入序）。
+    std::vector<std::pair<std::string, std::string>> list;
 
     void qjs_init(JSContext* ctx, qjs::Opt<qjs::Value> init); // 定义见 headers_from 之后
 
@@ -77,92 +87,189 @@ struct HeadersImpl {
     static std::string normalize_name(JSContext* ctx, const std::string& raw) {
         const std::string name = trim_http_ws(raw);
         if (name.empty() || name.size() > 128)
-            JS_Throw(ctx, JS_NewTypeError(ctx, "Headers: name 非法"));
-    throw qjs::js_error(ctx, JS_GetException(ctx));
+            throw_type_error(ctx, "Headers: name 非法");
         for (const char c : name)
             if (!is_http_token_char(c))
-                JS_Throw(ctx, JS_NewTypeError(ctx, "Headers: name 含非法字符"));
-    throw qjs::js_error(ctx, JS_GetException(ctx));
+                throw_type_error(ctx, "Headers: name 含非法字符");
         std::string lower = name;
         std::transform(lower.begin(), lower.end(), lower.begin(),
                        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
         return lower;
     }
     static std::string normalize_value(JSContext* ctx, const std::string& raw) {
-        const std::string value = trim_http_ws(raw);
+        // 首尾 HTTP 空白（SP/TAB/CR/LF，obs-fold 语义）去掉；中间残留 CR/LF/NUL → TypeError
+        size_t b = 0, e = raw.size();
+        auto is_ws = [](char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; };
+        while (b < e && is_ws(raw[b]))
+            ++b;
+        while (e > b && is_ws(raw[e - 1]))
+            --e;
+        const std::string value = raw.substr(b, e - b);
         for (const char c : value)
             if (c == '\r' || c == '\n' || c == '\0')
-                JS_Throw(ctx, JS_NewTypeError(ctx, "Headers: value 含非法字符"));
-    throw qjs::js_error(ctx, JS_GetException(ctx));
+                throw_type_error(ctx, "Headers: value 含非法字符");
+        // ByteString 转换检查：UTF-8 代码点 > U+00FF → TypeError（wpt headers-errors）
+        for (auto it = value.begin(); it != value.end();) {
+            uint32_t cp = 0;
+            try {
+                cp = utf8::next(it, value.end());
+            } catch (...) {
+                throw_type_error(ctx, "Headers: value 非 UTF-8");
+            }
+            if (cp > 0xFF)
+                throw_type_error(ctx, "Headers: value 代码点超出 ByteString 范围");
+        }
         return value;
     }
 
-    void check_forbidden(JSContext* ctx, const std::string& lower_name) const {
-        if (guard == Guard::Request || guard == Guard::RequestNoCors) {
-            if (guard == Guard::Request && is_forbidden_request_header(lower_name))
-                throw qjs::js_error(ctx,
-                                    JS_Throw(ctx, JS_NewTypeError(ctx, "Headers: %s 是 forbidden 请求头",
-                                                      lower_name.c_str())));
-            if (guard == Guard::RequestNoCors && lower_name != "accept" &&
-                lower_name != "accept-language" && lower_name != "content-language" &&
-                lower_name != "content-type")
-                throw qjs::js_error(ctx,
-                                    JS_Throw(ctx, JS_NewTypeError(ctx, "Headers: %s 在 no-cors 下 forbidden",
-                                                      lower_name.c_str())));
+    // fetch 规范：guard=request/request-no-cors/response 下，append/set/delete
+    // 对 forbidden 头静默忽略（不存储、不抛错）；get/has 不检查 guard。
+    // method-override 头（x-http-method 等）的值按逗号分列、trim、小写后
+    // 任一项是 forbidden method（trace/track/connect）→ 同样忽略。
+    bool forbidden(JSContext* ctx, const std::string& lower_name, const std::string& value) const {
+        if (guard == Guard::Request && is_forbidden_request_header(lower_name))
+            return true;
+        if (guard == Guard::Request && is_method_override_header(lower_name)) {
+            std::string part;
+            auto check_part = [&] {
+                size_t b = 0, e = part.size();
+                while (b < e && (part[b] == ' ' || part[b] == '\t'))
+                    ++b;
+                while (e > b && (part[e - 1] == ' ' || part[e - 1] == '\t'))
+                    --e;
+                std::string p = part.substr(b, e - b);
+                std::transform(p.begin(), p.end(), p.begin(),
+                               [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                return p == "trace" || p == "track" || p == "connect";
+            };
+            for (char c : value) {
+                if (c == ',') {
+                    if (check_part())
+                        return true;
+                    part.clear();
+                } else {
+                    part.push_back(c);
+                }
+            }
+            if (check_part())
+                return true;
         }
+        if (guard == Guard::RequestNoCors && lower_name != "accept" &&
+            lower_name != "accept-language" && lower_name != "content-language" &&
+            lower_name != "content-type")
+            return true;
         if (guard == Guard::Response && is_forbidden_response_header(lower_name))
-            throw qjs::js_error(ctx,
-                                JS_Throw(ctx, JS_NewTypeError(ctx, "Headers: %s 是 forbidden 响应头",
-                                                  lower_name.c_str())));
+            return true;
+        return false;
     }
 
     void append(JSContext* ctx, const std::string& name_raw, const std::string& value_raw) {
         const std::string name = normalize_name(ctx, name_raw);
         const std::string value = normalize_value(ctx, value_raw);
-        check_forbidden(ctx, name);
-        auto it = list.find(name);
-        if (it != list.end())
-            it->second += ", " + value;
-        else
-            list.emplace(name, value);
+        // 规范：仅 immutable guard 完全不可变（抛 TypeError）；response guard 下
+        // forbidden 响应头（set-cookie）静默忽略（forbidden 检查），其他可改
+        if (guard == Guard::Immutable)
+            throw_type_error(ctx, "Headers: guard=immutable 不可修改");
+        if (forbidden(ctx, name, value))
+            return; // 静默忽略
+        list.push_back({name, value});
     }
     void set(JSContext* ctx, const std::string& name_raw, const std::string& value_raw) {
         const std::string name = normalize_name(ctx, name_raw);
         const std::string value = normalize_value(ctx, value_raw);
-        check_forbidden(ctx, name);
-        list[name] = value;
+        if (guard == Guard::Immutable)
+            throw_type_error(ctx, "Headers: guard=immutable 不可修改");
+        if (forbidden(ctx, name, value))
+            return; // 静默忽略
+        erase_all(name);
+        list.push_back({name, value});
     }
     void erase(JSContext* ctx, const std::string& name_raw) {
         const std::string name = normalize_name(ctx, name_raw);
-        check_forbidden(ctx, name);
-        list.erase(name);
+        if (guard == Guard::Immutable)
+            throw_type_error(ctx, "Headers: guard=immutable 不可修改");
+        if (forbidden(ctx, name, ""))
+            return; // 静默忽略
+        erase_all(name);
     }
     bool has(JSContext* ctx, const std::string& name_raw) const {
         const std::string name = normalize_name(ctx, name_raw);
-        check_forbidden(ctx, name);
-        return list.count(name) != 0;
+        // 规范：response guard 下 forbidden 响应头（set-cookie）→ false
+        if (guard == Guard::Response && is_forbidden_response_header(name))
+            return false;
+        for (const auto& [k, v] : list)
+            if (k == name)
+                return true;
+        return false;
     }
     std::optional<std::string> get(JSContext* ctx, const std::string& name_raw) const {
         const std::string name = normalize_name(ctx, name_raw);
-        check_forbidden(ctx, name);
-        const auto it = list.find(name);
-        return it == list.end() ? std::nullopt : std::optional<std::string>(it->second);
+        // 规范：response guard 下 forbidden 响应头（set-cookie）→ null
+        if (guard == Guard::Response && is_forbidden_response_header(name))
+            return std::nullopt;
+        std::string out;
+        bool first = true;
+        for (const auto& [k, v] : list) {
+            if (k == name) {
+                if (!first)
+                    out += ", ";
+                out += v;
+                first = false;
+            }
+        }
+        return first ? std::nullopt : std::optional<std::string>(std::move(out));
     }
-    // 有序键值对（迭代用）
-    std::vector<std::pair<std::string, std::string>> sorted_entries() const {
-        std::vector<std::pair<std::string, std::string>> out;
-        out.reserve(list.size());
+    // 内部直存（fetch 响应组装用，绕过 guard 检查；name 仍需小写化）
+    void append_raw(const std::string& name, const std::string& value) {
+        std::string lower = name;
+        std::transform(lower.begin(), lower.end(), lower.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        list.push_back({std::move(lower), value});
+    }
+    // getSetCookie()：set-cookie 值数组（不合并）
+    std::vector<std::string> get_set_cookie() const {
+        std::vector<std::string> out;
         for (const auto& [k, v] : list)
-            out.push_back({k, v});
+            if (k == "set-cookie")
+                out.push_back(v);
         return out;
+    }
+    // 有序键值对（迭代用）：按 name 排序 + 同名合并（", " 连接）；
+    // set-cookie 例外：不合并、保持插入序（fetch 规范，wpt header-setcookie）
+    std::vector<std::pair<std::string, std::string>> sorted_entries() const {
+        std::vector<std::pair<std::string, std::string>> out = list;
+        std::stable_sort(out.begin(), out.end(),
+                         [](const auto& a, const auto& b) { return a.first < b.first; });
+        std::vector<std::pair<std::string, std::string>> merged;
+        for (const auto& p : out) {
+            if (p.first == "set-cookie") {
+                merged.push_back(p);
+            } else if (merged.empty() || merged.back().first != p.first) {
+                merged.push_back(p);
+            } else {
+                merged.back().second += ", " + p.second;
+            }
+        }
+        return merged;
+    }
+
+private:
+    void erase_all(const std::string& name)
+    {
+        list.erase(std::remove_if(list.begin(), list.end(),
+                                  [&](const auto& p) { return p.first == name; }),
+                   list.end());
     }
 };
 
 // JS init 参数 → HeadersImpl（undefined / Headers 实例 / record / 序列 of pairs）
 inline HeadersImpl headers_from(JSContext* ctx, JSValueConst init) {
     HeadersImpl out;
-    if (JS_IsUndefined(init) || JS_IsNull(init))
+    if (JS_IsUndefined(init))
         return out;
+    // 规范：null 也抛 TypeError（仅 undefined 表示空）
+    if (JS_IsNull(init))
+        throw_type_error(ctx, "Headers: init 不能为 null");
     // 已注册的 HeadersImpl 实例 → 拷贝
     if (JS_IsObject(init)) {
         auto& reg = qjs::registry_of(ctx);
@@ -171,15 +278,21 @@ inline HeadersImpl headers_from(JSContext* ctx, JSValueConst init) {
         }
     }
     if (JS_IsArray(init)) {
-        qjs::Array arr(ctx, init);
+        // init 是借用值：dup 后交由 arr 接管（否则调用方析构 double-free）
+        qjs::Array arr(ctx, JS_DupValue(ctx, init));
         for (std::size_t i = 0; i < arr.length(); ++i) {
             qjs::Value item = arr.get(i);
             if (!JS_IsArray(item.raw())) {
-                JS_Throw(ctx, JS_NewTypeError(ctx, "Headers: 序列项不是 [name, value] 数组"));
-                throw qjs::js_error(ctx, JS_GetException(ctx));
+                throw_type_error(ctx, "Headers: 序列项不是 [name, value] 数组");
             }
-            qjs::Array pair(ctx, item.raw());
-            out.append(ctx, pair.get(0).as<std::string>(), pair.get(1).as<std::string>());
+            qjs::Array pair(std::move(item)); // 移动接管 item 的唯一引用
+            // 规范：每项必须是 [name, value] 两元素数组；元素经 ToString 转 ByteString
+            //（null → "null" 等；非 ASCII 代码点由 normalize_value 的 ByteString 检查拦截）
+            if (pair.length() != 2)
+                throw_type_error(ctx, "Headers: 序列项必须是 [name, value] 二元组");
+            qjs::Value k = pair.get(0);
+            qjs::Value v = pair.get(1);
+            out.append(ctx, k.as<std::string>(), v.as<std::string>());
         }
         return out;
     }
@@ -197,8 +310,7 @@ inline HeadersImpl headers_from(JSContext* ctx, JSValueConst init) {
         js_free(ctx, props);
         return out;
     }
-    JS_Throw(ctx, JS_NewTypeError(ctx, "Headers: 不支持的 init 参数"));
-    throw qjs::js_error(ctx, JS_GetException(ctx));
+    throw_type_error(ctx, "Headers: 不支持的 init 参数");
 }
 
 // qjs_init 类外定义（依赖 headers_from）
@@ -246,6 +358,14 @@ inline void install_headers(qjs::Context& ctx) {
                        return v ? qjs::Value(ctx.ctx, JS_NewString(ctx.ctx, v->c_str()))
                                 : qjs::Value(ctx.ctx, JS_NULL);
                    })
+                   .method("getSetCookie", [](qjs::Ctx ctx, qjs::This<HeadersImpl> self) -> qjs::Value {
+                       const auto vals = self->get_set_cookie();
+                       qjs::Array arr(ctx.ctx, JS_NewArray(ctx.ctx));
+                       std::size_t i = 0;
+                       for (const auto& v : vals)
+                           arr.set(i++, qjs::Value(ctx.ctx, JS_NewString(ctx.ctx, v.c_str())));
+                       return qjs::Value(std::move(arr));
+                   })
                    .method("entries",
                            [](qjs::Ctx ctx, qjs::This<HeadersImpl> self) -> qjs::Value {
                                return header_entries_to_js(ctx.ctx, self->sorted_entries(), false);
@@ -280,6 +400,10 @@ inline void install_headers(qjs::Context& ctx) {
                                }
                            });
     ctx.globals().set("Headers", cls.constructor_function());
+    // Symbol.iterator（vcpkg quickjs.h 无公共 atom 常量，JS 侧补丁最稳）
+    ctx.eval(
+        "Headers.prototype[Symbol.iterator] = function* () { yield* this.entries(); };"
+        "Headers.prototype[Symbol.toStringTag] = 'Headers';");
 }
 
 } // namespace qjsbind::web

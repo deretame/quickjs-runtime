@@ -124,8 +124,13 @@ exec::task<HttpResponse> do_exchange(Stream& stream, const HttpRequest& req,
                                                ? ""
                                                : ":" + url.port));
     hreq.set(http::field::user_agent, "qjs-runtime/0.1 (+wpt)");
-    hreq.set(http::field::accept, "*/*");
-    hreq.set(http::field::connection, "close");
+    // 默认 Accept/Accept-Language 只在用户未设置时生效（wpt accept-header 测试）
+    if (hreq.find(http::field::accept) == hreq.end())
+        hreq.set(http::field::accept, "*/*");
+    if (hreq.find(http::field::accept_language) == hreq.end())
+        hreq.set(http::field::accept_language, "en-US,en;q=0.9");
+    // 不设 Connection 头：wpt inspect-headers 测试要求 fetch 请求不含连接管理头；
+    // 响应读完 socket 直接析构关闭。
     if (!req.body.empty()) {
         hreq.body() = req.body;
         hreq.prepare_payload();

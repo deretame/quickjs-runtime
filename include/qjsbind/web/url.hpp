@@ -10,6 +10,7 @@
 #include <qjsbind/class.hpp>
 #include <qjsbind/context.hpp>
 #include <qjsbind/value.hpp>
+#include <qjsbind/web/errors.hpp>
 #include <qjsbind/web/utf8.hpp>
 
 #include <boost/url/parse.hpp>
@@ -194,14 +195,14 @@ inline UrlSearchParamsImpl url_search_params_from(JSContext* ctx, JSValueConst i
     }
     if (JS_IsArray(init)) {
         UrlSearchParamsImpl out;
-        qjs::Array arr(ctx, init);
+        // init 是借用值：dup 后交由 arr 接管（否则调用方析构 double-free）
+        qjs::Array arr(ctx, JS_DupValue(ctx, init));
         for (std::size_t i = 0; i < arr.length(); ++i) {
             qjs::Value item = arr.get(i);
             if (!JS_IsArray(item.raw())) {
-                JS_Throw(ctx, JS_NewTypeError(ctx, "URLSearchParams: 序列项不是 [name, value] 数组"));
-                throw qjs::js_error(ctx, JS_GetException(ctx));
+                throw_type_error(ctx, "URLSearchParams: 序列项不是 [name, value] 数组");
             }
-            qjs::Array pair(ctx, item.raw());
+            qjs::Array pair(std::move(item)); // 移动接管 item 的唯一引用
             qjs::Value k = pair.get(0);
             qjs::Value v = pair.get(1);
             out.list.push_back({k.as<std::string>(), v.as<std::string>()});
@@ -223,8 +224,7 @@ inline UrlSearchParamsImpl url_search_params_from(JSContext* ctx, JSValueConst i
         js_free(ctx, props);
         return out;
     }
-    JS_Throw(ctx, JS_NewTypeError(ctx, "URLSearchParams: 不支持的 init 参数"));
-    throw qjs::js_error(ctx, JS_GetException(ctx));
+    throw_type_error(ctx, "URLSearchParams: 不支持的 init 参数");
 }
 
 // JS 数组（每项 [name, value] 或 name）构造（entries/keys/values 的 v1 返回形态）
@@ -296,6 +296,10 @@ inline void install_url_search_params(qjs::Context& ctx) {
                                }
                            });
     ctx.globals().set("URLSearchParams", cls.constructor_function());
+    // Symbol.iterator（vcpkg quickjs.h 无公共 atom 常量，JS 侧补丁最稳）
+    ctx.eval(
+        "URLSearchParams.prototype[Symbol.iterator] = function* () { yield* this.entries(); };"
+        "URLSearchParams.prototype[Symbol.toStringTag] = 'URLSearchParams';");
 }
 
 // ---------- URL ----------
@@ -304,35 +308,95 @@ struct UrlImpl {
     boost::urls::url u; // 绝对 URL
 
     void qjs_init(JSContext* ctx, qjs::Opt<qjs::Value> url, qjs::Opt<qjs::Value> base) {
-        std::string base_str;
-        if (base && !base->is_undefined() && !base->is_null())
-            base_str = base->as<std::string>();
-        *this = parse(ctx, url ? url->as<std::string>() : std::string{}, base_str);
+        // 字符串取 UTF-16 单元转 UTF-8：孤立代理 → U+FFFD（WHATWG URL 行为；
+        // JS_ToCString 保留 CESU-8 不替换，编码结果与浏览器不一致）
+        std::string url_str, base_str;
+        if (url && !url->is_undefined() && !url->is_null()) {
+            size_t len = 0;
+            const uint16_t* units = JS_ToCStringLenUTF16(ctx, &len, url->raw());
+            if (units)
+                url_str = utf16_to_utf8(units, len);
+            JS_FreeCStringUTF16(ctx, units);
+        }
+        if (base && !base->is_undefined() && !base->is_null()) {
+            size_t len = 0;
+            const uint16_t* units = JS_ToCStringLenUTF16(ctx, &len, base->raw());
+            if (units)
+                base_str = utf16_to_utf8(units, len);
+            JS_FreeCStringUTF16(ctx, units);
+        }
+        *this = parse(ctx, url_str, base_str);
     }
 
     // WHATWG 解析：绝对引用直接用；相对引用必须带 base（无 base → TypeError）
+    // boost 严格语法拒绝的字符（非 ASCII、| 等 WHATWG 允许的）→ 宽松编码重试。
+    // 注意：parse_uri_reference 返回的 url_view 借用输入字符串，relax 结果必须
+    // 存活到 url_view 使用完毕（否则悬垂）。
     static UrlImpl parse(JSContext* ctx, std::string_view str, std::string_view base) {
+        std::string relaxed_storage;
         auto r = boost::urls::parse_uri_reference(str);
         if (r.has_error()) {
-            JS_Throw(ctx, JS_NewTypeError(ctx, "URL: 无法解析 '%s'", std::string(str).c_str()));
-            throw qjs::js_error(ctx, JS_GetException(ctx));
+            relaxed_storage = relax_url_chars(str);
+            r = boost::urls::parse_uri_reference(relaxed_storage);
+            if (r.has_error()) {
+                throw_type_error(ctx, "URL: 无法解析 '%s'", std::string(str).c_str());
+            }
         }
         UrlImpl out;
         if (r->has_scheme()) {
             out.u = boost::urls::url(*r);
         } else {
             if (base.empty())
-                JS_Throw(ctx, JS_NewTypeError(ctx, "URL: 相对引用缺少 base"));
-    throw qjs::js_error(ctx, JS_GetException(ctx));
+                throw_type_error(ctx, "URL: 相对引用缺少 base");
+            std::string base_relaxed;
             auto rb = boost::urls::parse_uri_reference(base);
+            if (rb.has_error()) {
+                base_relaxed = relax_url_chars(base);
+                rb = boost::urls::parse_uri_reference(base_relaxed);
+            }
             if (rb.has_error())
-                JS_Throw(ctx, JS_NewTypeError(ctx, "URL: base 无法解析"));
-    throw qjs::js_error(ctx, JS_GetException(ctx));
+                throw_type_error(ctx, "URL: base 无法解析");
             out.u = boost::urls::url(*rb);
             auto res = out.u.resolve(*r);
             if (res.has_error())
-                JS_Throw(ctx, JS_NewTypeError(ctx, "URL: 相对解析失败"));
-    throw qjs::js_error(ctx, JS_GetException(ctx));
+                throw_type_error(ctx, "URL: 相对解析失败");
+        }
+        return out;
+    }
+
+    // 宽松编码：scheme://authority 保留；path/query/fragment 的非 ASCII 字节与
+    // WHATWG 不允许的 ASCII（|、空格、控制字符等）→ percent-encode
+    static std::string relax_url_chars(std::string_view url) {
+        size_t auth_end = 0;
+        const size_t scheme_end = url.find("://");
+        if (scheme_end != std::string_view::npos) {
+            const size_t path_start = url.find_first_of("/?#", scheme_end + 3);
+            auth_end = path_start == std::string_view::npos ? url.size() : path_start;
+        }
+        const char* hexd = "0123456789ABCDEF";
+        auto is_safe = [](unsigned char c) {
+            return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+                   c == '-' || c == '.' || c == '_' || c == '~' || c == '!' || c == '$' ||
+                   c == '&' || c == '\'' || c == '(' || c == ')' || c == '*' || c == '+' ||
+                   c == ',' || c == ';' || c == '=' || c == ':' || c == '@' || c == '/' ||
+                   c == '?' || c == '#' || c == '[' || c == ']';
+        };
+        auto is_hex = [](char c) {
+            return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+        };
+        std::string out;
+        for (size_t i = 0; i < url.size(); ++i) {
+            const unsigned char c = url[i];
+            // 裸 %（后非 2 hex）也编码为 %25（boost 严格语法拒绝裸 %）
+            const bool pct_ok = c == '%' && i + 2 < url.size() && is_hex(url[i + 1]) &&
+                                is_hex(url[i + 2]);
+            if (i < auth_end || is_safe(c) || pct_ok) {
+                out.push_back(static_cast<char>(c));
+            } else {
+                out.push_back('%');
+                out.push_back(hexd[c >> 4]);
+                out.push_back(hexd[c & 0xF]);
+            }
         }
         return out;
     }

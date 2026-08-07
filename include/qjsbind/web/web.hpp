@@ -19,6 +19,7 @@
 #include <qjsbind/web/headers.hpp>
 #include <qjsbind/web/net.hpp>
 #include <qjsbind/web/request_response.hpp>
+#include <qjsbind/web/stream.hpp>
 #include <qjsbind/web/timers.hpp>
 #include <qjsbind/web/url.hpp>
 
@@ -26,7 +27,10 @@
 
 namespace qjsbind::web {
 
-inline void install_web_apis(qjs::Context& ctx, std::shared_ptr<FetchBackend> backend) {
+inline void install_web_apis(
+    qjs::Context& ctx, std::shared_ptr<FetchBackend> backend,
+    std::vector<std::shared_ptr<FetchInterceptor>> interceptors = {
+        std::make_shared<AcceptEncodingInterceptor>() }) {
     install_dom_exception(ctx);
     install_event(ctx);
     install_text_encoder(ctx);
@@ -34,12 +38,13 @@ inline void install_web_apis(qjs::Context& ctx, std::shared_ptr<FetchBackend> ba
     install_url(ctx);
     install_abort(ctx);
     install_headers(ctx);
+    install_readable_stream(ctx); // 先于 Request/Response（body getter 返回流）
     install_request(ctx);
     install_response(ctx);
     install_blob(ctx);
     install_form_data(ctx);
     install_timers(ctx);
-    install_fetch(ctx, std::move(backend));
+    install_fetch(ctx, std::move(backend), std::move(interceptors));
 }
 
 } // namespace qjsbind::web

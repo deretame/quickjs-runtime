@@ -18,6 +18,8 @@
 #include <boost/beast/core.hpp>
 #include <boost/beast/http.hpp>
 #include <boost/url/parse.hpp>
+#include <brotli/encode.h>
+#include <zlib.h>
 
 #include <atomic>
 #include <cctype>
@@ -157,26 +159,55 @@ private:
             http::read(stream, buffer, req, ec);
             if (ec)
                 return;
+            const std::string target(req.target());
+
+            // ---- slow-response.py?delay=MS&content=X：头立即发出、body 延迟 ----
+            // 分片写（buffer_body）：第一段 only 头（content-length 已知），
+            // sleep 后第二段写 body。验证 fetch 在响应头到达时即 resolve。
+            if (target.starts_with("/slow-response.py")) {
+                const size_t qpos = target.find('?');
+                const auto q = parse_query(qpos == std::string::npos ? "" : target.substr(qpos));
+                int delay = 300;
+                try { delay = std::stoi(q.at("delay")); } catch (...) {}
+                const std::string content = q.count("content") ? q.at("content") : "";
+                // 手工分片写（beast 的 buffer_body 无法"只写头"）：
+                // 头（content-length 已知）立即发出，body 延迟 delay ms 后发出。
+                std::string head = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n"
+                                   "Content-Length: " +
+                                   std::to_string(content.size()) + "\r\n"
+                                   "Server: qjs-wpt/0.1\r\n"
+                                   "Connection: close\r\n\r\n";
+                stream.expires_after(std::chrono::seconds(5));
+                boost::asio::write(stream, boost::asio::buffer(head), ec);
+                if (ec)
+                    return;
+                std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+                stream.expires_after(std::chrono::seconds(5));
+                boost::asio::write(stream, boost::asio::buffer(content), ec);
+                return; // Connection: close：写完即断
+            }
+
             http::response<http::string_body> res;
-            handle_request(req, res);
+            handle_request(req, res, target);
             // HEAD 请求：响应不得含 body（规范）
             if (req.method() == http::verb::head)
                 res.body().clear();
-            res.prepare_payload();
+            // 端点显式设置过 content-length（bad-length.py 谎报长度）时不覆盖
+            if (res.find(http::field::content_length) == res.end())
+                res.prepare_payload();
             stream.expires_after(std::chrono::seconds(5));
             http::write(stream, res, ec);
-            if (ec || req.keep_alive() == false)
+            if (ec || req.keep_alive() == false || res.keep_alive() == false)
                 return;
         }
     }
 
     void handle_request(const http::request<http::string_body>& req,
-                        http::response<http::string_body>& res)
+                        http::response<http::string_body>& res, const std::string& target)
     {
         res.version(req.version());
         res.keep_alive(req.keep_alive());
         res.set(http::field::server, "qjs-wpt/0.1");
-        const std::string target(req.target());
         const size_t qpos = target.find('?');
         const std::string path = target.substr(0, qpos);
         const auto query = parse_query(qpos == std::string::npos ? "" : target.substr(qpos));
@@ -281,6 +312,67 @@ private:
             res.set("X-Request-Content-Type", header_or(req, http::field::content_type, "NO"));
             res.set(http::field::content_type, "text/plain");
             res.body() = req.body();
+            return;
+        }
+        // ---- compress.py?code=gzip|deflate|br：POST body 压缩回显（M3 解压测试）----
+        // 响应 Content-Encoding + X-Req-Accept-Encoding（回显客户端自动头，验证拦截器）
+        if (path.ends_with("/compress.py")) {
+            std::string code = query.count("code") ? query.at("code") : "gzip";
+            const std::string in = req.body();
+            std::string out;
+            if (code == "gzip") {
+                z_stream zs{};
+                deflateInit2(&zs, Z_DEFAULT_COMPRESSION, Z_DEFLATED, 15 + 16, 8,
+                             Z_DEFAULT_STRATEGY);
+                out.resize(deflateBound(&zs, static_cast<uLong>(in.size())));
+                zs.next_in = reinterpret_cast<Bytef*>(const_cast<char*>(in.data()));
+                zs.avail_in = static_cast<uInt>(in.size());
+                zs.next_out = reinterpret_cast<Bytef*>(out.data());
+                zs.avail_out = static_cast<uInt>(out.size());
+                deflate(&zs, Z_FINISH);
+                out.resize(zs.total_out);
+                deflateEnd(&zs);
+            } else if (code == "deflate") {
+                z_stream zs{};
+                deflateInit(&zs, Z_DEFAULT_COMPRESSION); // zlib 流（带头）
+                out.resize(deflateBound(&zs, static_cast<uLong>(in.size())));
+                zs.next_in = reinterpret_cast<Bytef*>(const_cast<char*>(in.data()));
+                zs.avail_in = static_cast<uInt>(in.size());
+                zs.next_out = reinterpret_cast<Bytef*>(out.data());
+                zs.avail_out = static_cast<uInt>(out.size());
+                deflate(&zs, Z_FINISH);
+                out.resize(zs.total_out);
+                deflateEnd(&zs);
+            } else { // br
+                const size_t cap = BrotliEncoderMaxCompressedSize(in.size());
+                out.resize(cap ? cap : 1);
+                size_t n = out.size();
+                BrotliEncoderCompress(4, 22, BROTLI_MODE_TEXT, in.size(),
+                                      reinterpret_cast<const uint8_t*>(in.data()), &n,
+                                      reinterpret_cast<uint8_t*>(out.data()));
+                out.resize(n);
+            }
+            res.set(http::field::content_type, "text/plain");
+            res.set("Content-Encoding", code);
+            res.set("X-Req-Accept-Encoding", header_or(req, http::field::accept_encoding, "NO"));
+            if (query.count("corrupt")) // 翻转末字节 → 客户端解码失败
+                out.back() ^= 0xFF;
+            if (query.count("trailing")) // 流尾追加垃圾字节（解压器应忽略）
+                out.append("GARBAGE-TRAILING-BYTES");
+            res.body() = std::move(out);
+            return;
+        }
+
+        // ---- bad-length.py?length=N&content=X：谎报 content-length，发完即断（读取失败测试）----
+        if (path.ends_with("/bad-length.py")) {
+            int length = 100;
+            try { length = std::stoi(query.at("length")); } catch (...) {}
+            const std::string content = query.count("content") ? query.at("content") : "";
+            res.result(http::status::ok);
+            res.set(http::field::content_type, "text/plain");
+            res.content_length(length);
+            res.keep_alive(false); // 发完即关连接 → 客户端读到 content-length 未满即 EOF
+            res.body() = content;
             return;
         }
 

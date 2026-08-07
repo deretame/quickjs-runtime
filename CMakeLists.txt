@@ -18,6 +18,8 @@ find_package(fmt CONFIG REQUIRED)
 find_package(spdlog CONFIG REQUIRED)
 find_package(Boost REQUIRED COMPONENTS asio uuid url)
 find_package(OpenSSL REQUIRED)
+find_package(ZLIB REQUIRED)
+find_package(unofficial-brotli CONFIG REQUIRED)
 find_package(utf8cpp CONFIG REQUIRED)
 find_package(stdexec CONFIG REQUIRED)
 find_package(qjs CONFIG REQUIRED)
@@ -34,7 +36,10 @@ target_include_directories(qjsbind INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include
 target_link_libraries(qjsbind INTERFACE qjs Boost::uuid Boost::url utf8cpp::utf8cpp)
 
 # ---- qjsbind_net：fetch 网络层（boost::beast + OpenSSL，静态库）----
-add_library(qjsbind_net STATIC src/net/http_client.cpp)
+add_library(qjsbind_net STATIC src/net/http_client.cpp src/net/socks5.cpp)
+if(MSVC)
+    target_compile_options(qjsbind_net PRIVATE /utf-8)
+endif()
 target_include_directories(qjsbind_net PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -44,6 +49,9 @@ target_link_libraries(qjsbind_net PUBLIC
     Boost::url
     OpenSSL::SSL
     OpenSSL::Crypto
+    ZLIB::ZLIB
+    unofficial::brotli::brotlidec
+    unofficial::brotli::brotlicommon
     STDEXEC::stdexec
 )
 
@@ -72,6 +80,7 @@ add_executable(quickjs_runtime_tests
     tests/m4_binding_test.cpp
     tests/fetch_test.cpp
     tests/wpt_runner.cpp
+    tests/socks5_test.cpp
 )
 target_link_libraries(quickjs_runtime_tests PRIVATE
     qjs
@@ -81,6 +90,8 @@ target_link_libraries(quickjs_runtime_tests PRIVATE
     fmt::fmt
     dart_cpp_bridge
     GTest::gtest_main
+    unofficial::brotli::brotlienc
+    ZLIB::ZLIB
 )
 include(GoogleTest)
 gtest_discover_tests(quickjs_runtime_tests)

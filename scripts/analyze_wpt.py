@@ -53,7 +53,8 @@ DIR_SKIP = (
 
 # ---- 内容级规则：未实现的 JS API（\b 边界，避免误匹配注释里的词）----
 JS_API_SKIP = [
-    (r"\bReadableStream\b", "ReadableStream 未实现"),
+    # v2 M2 起 ReadableStream/getReader 已实现（body getter 返回流）；
+    # 未实现的子集（tee/pipeTo/asyncIterator）由 expected 清单兜底
     (r"\bnew\s+Worker\b", "Worker 未实现"),
     (r"\bServiceWorker\b", "ServiceWorker 未实现"),
     (r"\bXMLHttpRequest\b", "XMLHttpRequest 未实现"),
@@ -67,7 +68,6 @@ JS_API_SKIP = [
     (r"\bnavigator\b", "navigator 未实现"),
     (r"\bdocument\.", "DOM document 未实现"),
     (r"\bwindow\.open\b", "window.open 未实现"),
-    (r"\bgetReader\s*\(", "body 流（getReader）未实现"),
     (r"\bMediaSource\b", "MediaSource 未实现"),
     # RequestInit 未实现字段
     (r"['\"]keepalive['\"]\s*:", "keepalive 未实现"),

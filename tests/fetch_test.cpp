@@ -290,17 +290,20 @@ TEST_F(FetchFixture, FetchIntegrity)
     ASSERT_FALSE(r.is_exception());
     rt.run_to_completion();
     EXPECT_EQ(ctx.eval("__ok").as<int>(), 200);
-    // 错误摘要 → reject TypeError
+    // 错误摘要 → M3 消费末端校验：fetch resolve，text() reject TypeError
+    //（设计文档 §4.5；v1 是 fetch 直接 reject）
     r = ctx.eval(
         "fetch(base + '/echo-content.py', {method: 'POST', body: 'hello world',"
-        " integrity: 'sha384-' + 'A'.repeat(64)}).then(() => { globalThis.__bad = 'no'; })"
-        ".catch(e => { globalThis.__bad = e.name; }); 'ok'");
+        " integrity: 'sha384-' + 'A'.repeat(64)})"
+        ".then(x => { globalThis.__bad = 'resolved:' + x.status; return x.text(); })"
+        ".then(() => { globalThis.__bad += '|no'; },"
+        "      e => { globalThis.__bad += '|' + e.name; }); 'ok'");
     ASSERT_FALSE(r.is_exception());
     rt.run_to_completion();
-    EXPECT_EQ(ctx.eval("__bad").as<std::string>(), "TypeError");
+    EXPECT_EQ(ctx.eval("__bad").as<std::string>(), "resolved:200|TypeError");
     // 204 null body + integrity → reject TypeError（wpt response-null-body 语义）
     r = ctx.eval(
-        "fetch(base + '/status?code=204', {integrity: 'sha384-UT6f7WCFp32YJnp1is4l/ZYnOeQKpE8xjmdkLOwZ3nIP+tmT2aMRFQGJomjVf5cE'})"
+        "fetch(base + '/status.py?code=204', {integrity: 'sha384-UT6f7WCFp32YJnp1is4l/ZYnOeQKpE8xjmdkLOwZ3nIP+tmT2aMRFQGJomjVf5cE'})"
         ".then(() => { globalThis.__n = 'no'; })"
         ".catch(e => { globalThis.__n = e.name; }); 'ok'");
     ASSERT_FALSE(r.is_exception());
@@ -315,6 +318,70 @@ TEST_F(FetchFixture, FetchIntegrity)
     r = ctx.eval("new Request(base + '/echo-content.py', {integrity: ''}).integrity;");
     ASSERT_FALSE(r.is_exception());
     EXPECT_EQ(r.as<std::string>(), "");
+}
+
+TEST_F(FetchFixture, FetchCompressed)
+{
+    qjsbind::net::wpt::WptTestServer server("third_party/wpt");
+    const std::string base = server.base_url();
+    ctx.eval("var base = '" + base + "';");
+    // 三种编码：解压后内容一致；X-Req-Accept-Encoding 证明拦截器自动加了协商头
+    Value r = ctx.eval(
+        "var __ae = null, __out = [];"
+        "fetch(base + '/compress.py?code=gzip', {method: 'POST', body: 'hello world'})"
+        ".then(x => { __ae = x.headers.get('X-Req-Accept-Encoding'); return x.text(); })"
+        ".then(t => __out.push('gzip:' + t + ':ae=' + __ae));"
+        "fetch(base + '/compress.py?code=deflate', {method: 'POST', body: 'hello deflate'})"
+        ".then(x => x.text()).then(t => __out.push('deflate:' + t));"
+        "fetch(base + '/compress.py?code=br', {method: 'POST', body: 'hello brotli'})"
+        ".then(x => x.text()).then(t => __out.push('br:' + t));"
+        "fetch(base + '/compress.py?code=gzip&corrupt=1', {method: 'POST', body: 'garbage'})"
+        ".then(x => x.text()).then(t => __out.push('bad:' + t))"
+        ".catch(e => __out.push('bad:' + e.name));"
+        "globalThis.__out = __out; 'ok'");
+    ASSERT_FALSE(r.is_exception());
+    rt.run_to_completion();
+    EXPECT_EQ(ctx.eval("__out.join(',')").as<std::string>(),
+              "bad:TypeError,gzip:hello world:ae=gzip, deflate, br,deflate:hello deflate,"
+              "br:hello brotli");
+    // 解压 + SRI：摘要基于解压后内容（sha384('hello world') 通过 → 200 且 text 正常）
+    r = ctx.eval(
+        "fetch(base + '/compress.py?code=gzip', {method: 'POST', body: 'hello world',"
+        " integrity: 'sha384-/b2OdaZ/KfcBpOBAOF4uI5hjA+oQI5IRr5B/y7g1eLPkF8txzmRu/QgZ3YwIjeG9'})"
+        ".then(x => x.text()).then(t => { globalThis.__sri = t; }); 'ok'");
+    ASSERT_FALSE(r.is_exception());
+    rt.run_to_completion();
+    EXPECT_EQ(ctx.eval("__sri").as<std::string>(), "hello world");
+    // url-safe 变体 + 去 padding 的 integrity 同样通过（-_ → +/ 归一化）
+    r = ctx.eval(
+        "fetch(base + '/compress.py?code=gzip', {method: 'POST', body: 'hello world',"
+        " integrity: 'sha384-_b2OdaZ_KfcBpOBAOF4uI5hjA-oQI5IRr5B_y7g1eLPkF8txzmRu_QgZ3YwIjeG9'})"
+        ".then(x => x.text()).then(t => { globalThis.__sri2 = t; }); 'ok'");
+    ASSERT_FALSE(r.is_exception());
+    rt.run_to_completion();
+    EXPECT_EQ(ctx.eval("__sri2").as<std::string>(), "hello world");
+    // >64KiB body：压缩流跨多个 64KiB 块边界（gzip/deflate/br 三编码）
+    r = ctx.eval(
+        "var big = 'A'.repeat(70 * 1024);"
+        "fetch(base + '/compress.py?code=gzip', {method: 'POST', body: big})"
+        ".then(x => x.text()).then(t => { globalThis.__big = t.length; });"
+        "fetch(base + '/compress.py?code=deflate', {method: 'POST', body: big})"
+        ".then(x => x.text()).then(t => { globalThis.__bigd = t.length; });"
+        "fetch(base + '/compress.py?code=br', {method: 'POST', body: big})"
+        ".then(x => x.text()).then(t => { globalThis.__bigb = t.length; }); 'ok'");
+    ASSERT_FALSE(r.is_exception());
+    rt.run_to_completion();
+    EXPECT_EQ(ctx.eval("__big + ',' + __bigd + ',' + __bigb").as<std::string>(),
+              "71680,71680,71680");
+    // trailing 字节：流尾垃圾应被忽略（三编码）
+    r = ctx.eval(
+        "fetch(base + '/compress.py?code=gzip&trailing=1', {method: 'POST', body: 'hi'})"
+        ".then(x => x.text()).then(t => { globalThis.__tr = t; });"
+        "fetch(base + '/compress.py?code=br&trailing=1', {method: 'POST', body: 'hi'})"
+        ".then(x => x.text()).then(t => { globalThis.__trb = t; }); 'ok'");
+    ASSERT_FALSE(r.is_exception());
+    rt.run_to_completion();
+    EXPECT_EQ(ctx.eval("__tr + ',' + __trb").as<std::string>(), "hi,hi");
 }
 
 TEST_F(FetchFixture, FetchDataUrl)
@@ -733,6 +800,143 @@ TEST_F(FetchFixture, BlobTypeKeepsParamsAndMultipartCaseInsensitive)
     ASSERT_FALSE(r.is_exception());
     rt.run_to_completion();
     EXPECT_EQ(ctx.eval("__efd").as<std::string>(), "true|true|true|null");
+}
+
+// ---- v2 M1：后端流式化（fetch resolve 提前；body 读干；中途 abort/失败）----
+TEST_F(FetchFixture, M1FetchResolvesBeforeBody)
+{
+    // slow-response：响应头立即发出、body 延迟 200ms——fetch 在头部到达时即
+    // resolve（v1 需等全量 body），text() 随后读干。
+    qjsbind::net::wpt::WptTestServer server("third_party/wpt");
+    const std::string base = server.base_url();
+    ctx.eval("var base = '" + base + "';");
+    Value r = ctx.eval(
+        "var t0 = Date.now();"
+        "fetch(base + '/slow-response.py?delay=200&content=hello').then(x => {"
+        " globalThis.__early = x.status + '|' + (Date.now() - t0 < 150);"
+        " return x.text();"
+        "}).then(t => { globalThis.__late = t + '|' + (Date.now() - t0 >= 180); });"
+        "'ok'");
+    ASSERT_FALSE(r.is_exception());
+    rt.run_to_completion();
+    // resolve 早于 body 完成；text() 读干得到完整 body
+    EXPECT_EQ(ctx.eval("__early").as<std::string>(), "200|true");
+    EXPECT_EQ(ctx.eval("__late").as<std::string>(), "hello|true");
+}
+
+TEST_F(FetchFixture, M1FetchAbortDuringBody)
+{
+    // 慢响应：fetch resolve 后 abort → 挂起的读 reject AbortError（设计文档 §3.3）
+    qjsbind::net::wpt::WptTestServer server("third_party/wpt");
+    const std::string base = server.base_url();
+    ctx.eval("var base = '" + base + "';");
+    Value r = ctx.eval(
+        "var c = new AbortController();"
+        "globalThis.__ab = 'pending';"
+        "fetch(base + '/slow-response.py?delay=400&content=hello', {signal: c.signal})"
+        ".then(x => { globalThis.__ab = 'resolved'; c.abort(); return x.text(); })"
+        ".then(t => { globalThis.__ab += '|' + t; },"
+        "      e => { globalThis.__ab += '|' + e.name; });"
+        "'ok'");
+    ASSERT_FALSE(r.is_exception());
+    rt.run_to_completion();
+    EXPECT_EQ(ctx.eval("__ab").as<std::string>(), "resolved|AbortError");
+}
+
+TEST_F(FetchFixture, M1FetchBodyReadError)
+{
+    // 谎报 content-length：头后连接即断 → 读 body 中途失败 → 消费 reject TypeError
+    //（fetch 已 resolve；v1 是 fetch 直接 reject）
+    qjsbind::net::wpt::WptTestServer server("third_party/wpt");
+    const std::string base = server.base_url();
+    ctx.eval("var base = '" + base + "';");
+    Value r = ctx.eval(
+        "fetch(base + '/bad-length.py?length=100&content=hello')"
+        ".then(x => { globalThis.__bl = 'resolved:' + x.status; return x.text(); })"
+        ".then(t => { globalThis.__bl += '|' + t; },"
+        "      e => { globalThis.__bl += '|' + e.name; });"
+        "'ok'");
+    ASSERT_FALSE(r.is_exception());
+    rt.run_to_completion();
+    const std::string out = ctx.eval("__bl").as<std::string>();
+    EXPECT_TRUE(out.rfind("resolved:200|", 0) == 0) << out;
+    EXPECT_EQ(out, "resolved:200|TypeError") << out;
+}
+
+// ---- v2 M2：ReadableStream 绑定（body getter/reader/tee/abort 语义）----
+TEST_F(FetchFixture, M2BodyStreamBasics)
+{
+    // body getter 返回流；locked/bodyUsed/getReader/read 基本语义
+    Value r = ctx.eval(
+        "var resp = new Response('hello');"
+        "globalThis.__bs = String(resp.body.constructor.name) + '|' + resp.body.locked + '|' + resp.bodyUsed;"
+        "var reader = resp.body.getReader();"
+        "globalThis.__bs += '|' + resp.body.locked + '|' + resp.bodyUsed;"
+        "reader.read().then(function(x) {"
+        "  var td = new TextDecoder();"
+        "  globalThis.__bs += '|' + x.done + '|' + td.decode(x.value);"
+        "  return reader.read();"
+        "}).then(function(x) { globalThis.__bs += '|' + x.done + '|' + resp.bodyUsed; });"
+        "'ok'");
+    ASSERT_FALSE(r.is_exception());
+    rt.run_to_completion();
+    EXPECT_EQ(ctx.eval("__bs").as<std::string>(),
+              "ReadableStream|false|false|true|false|false|hello|true|true");
+}
+
+TEST_F(FetchFixture, M2BodyLockedConsume)
+{
+    // getReader 后消费方法 reject TypeError；reader GC 后流仍锁定（wpt 语义）
+    Value r = ctx.eval(
+        "var resp = new Response('x');"
+        "resp.body.getReader();" // 返回值丢弃（reader 可被 GC）
+        "var threw = false;"
+        "resp.blob().then(function() { globalThis.__lc = 'resolved'; },"
+        "                  function(e) { globalThis.__lc = e.name; });"
+        "'ok'");
+    ASSERT_FALSE(r.is_exception());
+    rt.run_to_completion();
+    EXPECT_EQ(ctx.eval("__lc").as<std::string>(), "TypeError");
+}
+
+TEST_F(FetchFixture, M2CloneTee)
+{
+    // clone：tee 共享底层，两侧独立读；disturbed 检查
+    Value r = ctx.eval(
+        "var resp = new Response('hello');"
+        "var c = resp.clone();"
+        "Promise.all([resp.text(), c.text()]).then(function(ts) {"
+        "  globalThis.__ct = ts[0] + '|' + ts[1];"
+        "}, function(e) { globalThis.__ct = 'rej:' + e.name; });"
+        "'ok'");
+    ASSERT_FALSE(r.is_exception());
+    rt.run_to_completion();
+    EXPECT_EQ(ctx.eval("__ct").as<std::string>(), "hello|hello");
+}
+
+TEST_F(FetchFixture, M2FetchResponseStream)
+{
+    // fetch 响应 body 流式读取（慢响应：read 挂起后数据到达）
+    qjsbind::net::wpt::WptTestServer server("third_party/wpt");
+    const std::string base = server.base_url();
+    ctx.eval("var base = '" + base + "';");
+    Value r = ctx.eval(
+        "fetch(base + '/slow-response.py?delay=150&content=streamed').then(function(resp) {"
+        "  var reader = resp.body.getReader();"
+        "  var chunks = [];"
+        "  function pump() {"
+        "    return reader.read().then(function(x) {"
+        "      if (x.done) { globalThis.__fs = chunks.join('|') + '|used=' + resp.bodyUsed; return; }"
+        "      chunks.push(new TextDecoder().decode(x.value));"
+        "      return pump();"
+        "    });"
+        "  }"
+        "  return pump();"
+        "});"
+        "'ok'");
+    ASSERT_FALSE(r.is_exception());
+    rt.run_to_completion();
+    EXPECT_EQ(ctx.eval("__fs").as<std::string>(), "streamed|used=true");
 }
 
 } // namespace

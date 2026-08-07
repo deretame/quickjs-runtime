@@ -10,9 +10,11 @@
 #include <boost/url/parse.hpp>
 #include <exec/asio/use_sender.hpp>
 
+#include <functional>
 #include <memory>
 #include <optional>
 #include <stdexcept>
+#include <tuple>
 
 #include <openssl/bio.h>
 #include <openssl/err.h>
@@ -82,6 +84,7 @@ void load_pem_into_store(ssl::context& ctx, std::string_view pem) {
     // 其余 PEM 错误（如 base64 损坏）视为解析失败。
     if (err != 0 && (ERR_GET_LIB(err) != ERR_LIB_PEM || ERR_GET_REASON(err) != PEM_R_NO_START_LINE))
         throw std::runtime_error("TLS: PEM 解析失败");
+    ERR_clear_error(); // 成功路径清理线程局部错误队列（NO_START_LINE 属正常 EOF 标记）
 }
 
 // 共享的嵌入 CA store（进程级缓存；up_ref 一次自持，各 context 再 up_ref 后 set）
@@ -110,10 +113,9 @@ ssl::context make_ssl_context(const TlsOptions& tls) {
     return c;
 }
 
-// 组装 beast 请求并完成 write + read。Stream 为 tcp::socket 或 ssl::stream<tcp::socket>。
-template <class Stream>
-exec::task<HttpResponse> do_exchange(Stream& stream, const HttpRequest& req,
-                                     const ParsedUrl& url) {
+// 组装 beast 请求（不含 IO）
+http::request<http::string_body> make_beast_request(const HttpRequest& req,
+                                                    const ParsedUrl& url) {
     http::request<http::string_body> hreq;
     hreq.method_string(req.method);
     hreq.target(url.target);
@@ -135,30 +137,151 @@ exec::task<HttpResponse> do_exchange(Stream& stream, const HttpRequest& req,
         hreq.body() = req.body;
         hreq.prepare_payload();
     }
+    return hreq;
+}
 
+// 响应头（不含 body）
+struct ResponseHead {
+    int status = 0;
+    std::string reason;
+    std::vector<web::Header> headers;
+};
+
+// 完成 write + read_header（v1 do_exchange 的头部段）。返回 head + 移交 body 解析器。
+// parser 以 shared_ptr 传入：beast 的 response_parser 不可移动，且 body 阶段需要
+// 同一 parser 继续 async_read_some（由 BeastBodySource 持有）。
+template <class Stream>
+exec::task<std::pair<ResponseHead, beast::flat_buffer>>
+do_exchange_head(Stream& stream, const HttpRequest& req, const ParsedUrl& url,
+                 std::shared_ptr<http::response_parser<http::buffer_body>> parser) {
+    http::request<http::string_body> hreq = make_beast_request(req, url);
     co_await http::async_write(stream, hreq, exec::asio::use_sender);
 
     beast::flat_buffer buffer;
-    http::response<http::string_body> hres;
-    co_await http::async_read(stream, buffer, hres, exec::asio::use_sender);
+    co_await http::async_read_header(stream, buffer, *parser, exec::asio::use_sender);
 
-    HttpResponse out;
-    out.status = hres.result_int();
-    out.reason = std::string(hres.reason());
-    out.body = std::move(hres.body());
+    const auto& hres = parser->get();
+    ResponseHead head;
+    head.status = hres.result_int();
+    head.reason = std::string(hres.reason());
     for (const auto& f : hres.base())
-        out.headers.push_back({std::string(f.name_string()), std::string(f.value())});
-    co_return out;
+        head.headers.push_back({std::string(f.name_string()), std::string(f.value())});
+    co_return std::pair<ResponseHead, beast::flat_buffer>{std::move(head),
+                                                          std::move(buffer)};
 }
+
+// ---- BeastBodySource：流式 body 源（web::BodySource 的 beast 实现）----
+// 持有 stream（shared_ptr：头阶段与 body 阶段的 stop_callback 共享同一对象）、
+// flat_buffer、response_parser<buffer_body> 与 64 KiB 读缓冲。
+// read() = http::async_read_some → 返回本次消费的字节；parser.is_done() → nullopt
+// （chunked / content-length / need_eof 连接关闭终止都由 beast 处理）。
+// cancel() = lowest_layer().close()（同时唤醒挂起的 read，以 operation_aborted 完成）。
+// stop_callback 构造时注册（arm_stop）、析构时注销；回调跨线程，仅触碰 socket。
+template <class Stream>
+class BeastBodySource : public web::BodySource,
+                        public std::enable_shared_from_this<BeastBodySource<Stream>> {
+public:
+    BeastBodySource(std::shared_ptr<Stream> stream, beast::flat_buffer buffer,
+                    std::shared_ptr<http::response_parser<http::buffer_body>> parser,
+                    std::shared_ptr<ssl::context> ctx = nullptr)
+        : stream_(std::move(stream)), buffer_(std::move(buffer)), parser_(std::move(parser)),
+          ctx_(std::move(ctx))
+    {
+    }
+
+    ~BeastBodySource() override
+    {
+        // 注销 stop_callback（成员析构在前），关闭 socket 释放连接
+        boost::system::error_code ec;
+        stream_->lowest_layer().close(ec);
+    }
+
+    // 注册取消回调（weak 自持：回调执行期间 source 不会被析构）。
+    // 注册时若已 stop_requested → 立即回调（cancel）。
+    void arm_stop(std::stop_token st, std::weak_ptr<BeastBodySource> weak)
+    {
+        if (!st.stop_possible())
+            return;
+        stop_cb_.emplace(st, [weak] {
+            if (auto self = weak.lock())
+                self->cancel();
+        });
+    }
+
+    exec::task<std::optional<std::string>> read() override
+    {
+        for (;;) {
+            if (parser_->is_done()) {
+                co_return std::nullopt;
+            }
+            chunk_.resize(kChunkSize);
+            parser_->get().body().data = chunk_.data();
+            parser_->get().body().size = chunk_.size();
+            // 按值传 use_sender（async_compose 要求 CompletionToken 为可移动的值类型）
+            auto use_sender = exec::asio::use_sender;
+            bool aborted = false;
+            try {
+                co_await http::async_read_some(*stream_, buffer_, *parser_, use_sender);
+            } catch (const boost::system::system_error&) {
+                // 中止（stop）已请求后的一切读取失败都算 abort：挂起中的读被
+                // cancel() 唤醒后 asio 报 operation_aborted（use_sender 转 stopped，
+                // 协程在此终止，不走这里）；但"先 close 后新发起读"会报
+                // bad_descriptor 等错误 → 统一转 stopped → reject AbortError。
+                // （catch 块内不能 co_await，用标志延后）
+                if (cancelled_.load(std::memory_order_acquire))
+                    aborted = true;
+                else
+                    throw;
+            }
+            if (aborted)
+                co_await stdexec::just_stopped();
+            const size_t used = chunk_.size() - parser_->get().body().size;
+            chunk_.resize(used);
+            if (used > 0)
+                co_return std::move(chunk_);
+            // used == 0 且未 done：只消费了控制字节（chunk 边界），继续读
+        }
+    }
+
+    void cancel() override
+    {
+        cancelled_.store(true, std::memory_order_release);
+        boost::system::error_code ec;
+        stream_->lowest_layer().close(ec);
+    }
+
+private:
+    static constexpr size_t kChunkSize = 64 * 1024;
+    std::shared_ptr<Stream> stream_;
+    beast::flat_buffer buffer_;
+    std::shared_ptr<http::response_parser<http::buffer_body>> parser_;
+    std::shared_ptr<ssl::context> ctx_; // https：持有 ssl::context（须比 stream 活得久）
+    std::string chunk_;
+    std::atomic<bool> cancelled_{false};
+    std::optional<std::stop_callback<std::function<void()>>> stop_cb_;
+};
 
 } // namespace
 
-exec::task<HttpResponse> http_request(boost::asio::io_context& io, HttpRequest req,
-                                      TlsOptions tls, std::stop_token st) {
-    const ParsedUrl url = parse_url(req.url);
-
-    // 共享 socket：stop_callback 可能在其他线程触发（AbortController 走 JS 线程，
-    // Runtime::stop 走任意线程），cancel 期间 socket 必须存活。
+// 建立到目标的 TCP 连接：直连（resolver + connect）或经 SOCKS5 隧道（§3.4）。
+// 返回共享 socket：调用方在其上挂取消回调（connect / socks5 握手 / TLS 握手 /
+// 读头全程可取消；body 阶段由 BeastBodySource 接管）。
+exec::task<std::shared_ptr<tcp::socket>>
+connect_tcp(boost::asio::io_context& io, const std::string& host, const std::string& port,
+            std::stop_token st, const std::optional<Socks5Proxy>& proxy)
+{
+    if (proxy) {
+        // 与直连路径一致：端口非法/越界 → 抛（不静默默认 80）
+        int p = 0;
+        try {
+            p = std::stoi(port);
+        } catch (const std::exception&) {
+            throw std::invalid_argument("socks5: 非法端口 '" + port + "'");
+        }
+        if (p < 1 || p > 65535)
+            throw std::invalid_argument("socks5: 端口越界 '" + port + "'");
+        co_return co_await socks5_connect(io, *proxy, host, static_cast<uint16_t>(p), st);
+    }
     auto sock = std::make_shared<tcp::socket>(io);
     std::optional<std::stop_callback<std::function<void()>>> stop_cb;
     if (st.stop_possible()) {
@@ -167,40 +290,112 @@ exec::task<HttpResponse> http_request(boost::asio::io_context& io, HttpRequest r
             sock->cancel(ec); // operation_aborted → use_sender 转 set_stopped → AbortError
         });
     }
-
     tcp::resolver resolver(io);
     const auto results =
-        co_await resolver.async_resolve(url.host, url.port, exec::asio::use_sender);
-
-    if (url.scheme == "https") {
-        ssl::context ctx = make_ssl_context(tls);
-        ssl::stream<tcp::socket> stream(io, ctx);
-        stream.set_verify_callback(ssl::host_name_verification(url.host));
-        co_await stream.next_layer().async_connect(*results.begin(), exec::asio::use_sender);
-        co_await stream.async_handshake(ssl::stream_base::client, exec::asio::use_sender);
-        co_return co_await do_exchange(stream, req, url);
-    }
+        co_await resolver.async_resolve(host, port, exec::asio::use_sender);
     co_await sock->async_connect(*results.begin(), exec::asio::use_sender);
-    co_return co_await do_exchange(*sock, req, url);
+    co_return sock;
+}
+
+exec::task<HttpResponse> http_request(boost::asio::io_context& io, HttpRequest req,
+                                      TlsOptions tls, std::stop_token st,
+                                      std::optional<Socks5Proxy> proxy) {
+    const ParsedUrl url = parse_url(req.url);
+
+    auto sock = co_await connect_tcp(io, url.host, url.port, st, proxy);
+    // 取消回调挂共享 socket（同 connect_tcp 内的回调，双保险覆盖 connect 与
+    // 后续阶段之间的窗口；cancel 幂等）。
+    std::optional<std::stop_callback<std::function<void()>>> head_stop_cb;
+    if (st.stop_possible()) {
+        head_stop_cb.emplace(st, [sock] {
+            boost::system::error_code ec;
+            sock->cancel(ec);
+        });
+    }
+
+    std::shared_ptr<web::BodySource> body;
+    ResponseHead head;
+    if (url.scheme == "https") {
+        // ctx 随 body 源存活（boost 契约：context 须比 stream 活得久，BeastBodySource 持有）
+        auto ctx = std::make_shared<ssl::context>(make_ssl_context(tls));
+        // 隧道/直连 socket 直接移交 ssl::stream（SOCKS5 隧道上照常 TLS handshake）
+        auto stream = std::make_shared<ssl::stream<tcp::socket>>(std::move(*sock), *ctx);
+        stream->set_verify_callback(ssl::host_name_verification(url.host));
+        // sock 已 move 进 stream：取消回调改绑 stream 底层 socket（否则 abort 失效）
+        if (head_stop_cb)
+            head_stop_cb.emplace(st, [stream] {
+                boost::system::error_code ec;
+                stream->next_layer().cancel(ec);
+            });
+        co_await stream->async_handshake(ssl::stream_base::client, exec::asio::use_sender);
+        auto parser = std::make_shared<http::response_parser<http::buffer_body>>();
+        auto [h, buffer] = co_await do_exchange_head(*stream, req, url, parser);
+        head = std::move(h);
+        // 无 body 场景（HEAD / 204 / 205 / 304）：body = nullptr
+        if (req.method != "HEAD" && head.status != 204 && head.status != 205 &&
+            head.status != 304) {
+            auto src = std::make_shared<BeastBodySource<ssl::stream<tcp::socket>>>(
+                std::move(stream), std::move(buffer), std::move(parser), std::move(ctx));
+            src->arm_stop(st, src);
+            body = std::move(src);
+        }
+    } else {
+        auto parser = std::make_shared<http::response_parser<http::buffer_body>>();
+        auto [h, buffer] = co_await do_exchange_head(*sock, req, url, parser);
+        head = std::move(h);
+        if (req.method != "HEAD" && head.status != 204 && head.status != 205 &&
+            head.status != 304) {
+            auto src = std::make_shared<BeastBodySource<tcp::socket>>(
+                std::move(sock), std::move(buffer), std::move(parser));
+            src->arm_stop(st, src);
+            body = std::move(src);
+        }
+    }
+
+    HttpResponse out;
+    out.status = head.status;
+    out.reason = std::move(head.reason);
+    out.headers = std::move(head.headers);
+    out.body = std::move(body);
+    co_return out;
 }
 
 // ---- BeastFetchBackend：FetchBackend 适配（net 层类型 → web 层类型）----
-exec::task<web::HttpResponse> BeastFetchBackend::request(web::HttpRequest req,
-                                                         std::stop_token st) {
+namespace {
+// net 层 HttpRequest ← web 层 HttpRequest（同名同构，逐字段拷贝）
+HttpRequest net_request_from_web(const web::HttpRequest& req)
+{
     HttpRequest r;
-    r.method = std::move(req.method);
-    r.url = std::move(req.url);
-    for (auto& h : req.headers)
-        r.headers.push_back({std::move(h.name), std::move(h.value)});
-    r.body = std::move(req.body);
-    HttpResponse resp = co_await http_request(io_, std::move(r), TlsOptions{}, std::move(st));
+    r.method = req.method;
+    r.url = req.url;
+    r.headers = req.headers;
+    r.body = req.body;
+    return r;
+}
+// web 层 HttpResponse ← net 层 HttpResponse
+web::HttpResponse web_response_from_net(HttpResponse resp)
+{
     web::HttpResponse out;
     out.status = resp.status;
     out.reason = std::move(resp.reason);
-    for (auto& h : resp.headers)
-        out.headers.push_back({std::move(h.name), std::move(h.value)});
+    out.headers = std::move(resp.headers);
     out.body = std::move(resp.body);
-    co_return out;
+    return out;
+}
+} // namespace
+
+exec::task<web::HttpResponse> BeastFetchBackend::request(const web::HttpRequest& req,
+                                                         std::stop_token st) {
+    HttpResponse resp = co_await http_request(io_, net_request_from_web(req), tls_,
+                                              std::move(st), std::nullopt);
+    co_return web_response_from_net(std::move(resp));
+}
+
+exec::task<web::HttpResponse> BeastFetchBackend::request_via_socks5(
+    const web::HttpRequest& req, const Socks5Proxy& proxy, std::stop_token st) {
+    HttpResponse resp = co_await http_request(io_, net_request_from_web(req), tls_,
+                                              std::move(st), proxy);
+    co_return web_response_from_net(std::move(resp));
 }
 
 } // namespace qjsbind::net

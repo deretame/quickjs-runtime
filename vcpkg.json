@@ -10,6 +10,8 @@
     "boost-beast",
     "boost-url",
     "openssl",
+    "zlib",
+    "brotli",
     "utfcpp",
     { "name": "stdexec", "features": ["asio"] },
     "mpmcqueue",

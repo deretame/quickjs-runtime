@@ -27,7 +27,31 @@
     // consume-empty：空 FormData 的 text() 期望空串——但规范（HTML multipart
     // 编码）空表单序列化为 "--boundary--\r\n"（wpt 自带 FIXME 注明不确定，
     // response-form-data.html 的 "Empty form data" 与之矛盾）；按规范行为登记
-    'Consume empty FormData '
+    'Consume empty FormData ',
+    // ---- v2 M2 范围外（设计文档：用户级 ReadableStream 构造 M5 细化）----
+    // 用户级 new ReadableStream({start/pull}) 作 body 源
+    'body source: stream',
+    'with a stream on which',
+    'with a stream holds',
+    'ReadableStream body',
+    // pipeTo/pipeThrough（v2 不实现）
+    'pipeTo on Response body',
+    'pipeThrough on Response body',
+    // textStream 系列（2024 新增流式消费 API，v2 未实现）
+    'textStream',
+    // BYOB reader（{mode:'byob'}）
+    'byob',
+    'Reading with offset from Response stream',
+    // GC 测试（依赖 /common/gc.js 与用户级流）
+    'GC/CC should not abruptly close',
+    // Object.prototype.then 注入测试（用户级流 + add_completion_callback）
+    'via Object.prototype.then',
+    // 用户流状态机测试（disturbed-6）
+    'A non-closed stream on which',
+    'A closed stream on which',
+    'An errored stream on which',
+    // duplex 选项的用户流场景（fetch spec 2024；v2 不支持用户级流 body）
+    'duplex'
   ];
   function isExpectedFail(name) {
     return expectedFailures.some(function (p) { return String(name).indexOf(p) !== -1; });

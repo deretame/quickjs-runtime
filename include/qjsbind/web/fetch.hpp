@@ -11,6 +11,7 @@
 #include <qjsbind/context.hpp>
 #include <qjsbind/value.hpp>
 #include <qjsbind/web/errors.hpp>
+#include <qjsbind/web/interceptor.hpp>
 #include <qjsbind/web/net.hpp>
 #include <qjsbind/web/request_response.hpp>
 
@@ -258,9 +259,9 @@ inline void check_integrity(JSContext* ctx, const std::string& integrity, int st
 }
 
 inline exec::task<qjs::Value> fetch_impl(JSContext* ctx, std::shared_ptr<FetchBackend> backend,
-                                         std::string method, std::string url,
-                                         std::vector<Header> headers, std::string body,
-                                         const std::string& redirect_mode,
+                                         FetchHandler chain, std::string method,
+                                         std::string url, std::vector<Header> headers,
+                                         std::string body, const std::string& redirect_mode,
                                          const std::string& integrity, std::stop_token st) {
     // data: URL：本地构造响应（Node 行为：data URL 可 fetch，type=basic）
     if (url.rfind("data:", 0) == 0) {
@@ -272,8 +273,8 @@ inline exec::task<qjs::Value> fetch_impl(JSContext* ctx, std::shared_ptr<FetchBa
         ResponseImpl r;
         r.status = 200;
         r.status_text = "OK";
-        r.body_bytes = std::move(data);
-        r.has_body = true;
+        if (!data.empty() || method != "HEAD")
+            r.body_stream = bytes_to_stream(ctx, std::move(data));
         r.type = "basic";
         r.url = url;
         r.headers.set_guard(HeadersImpl::Guard::Immutable);
@@ -291,7 +292,7 @@ inline exec::task<qjs::Value> fetch_impl(JSContext* ctx, std::shared_ptr<FetchBa
 
         HttpResponse resp;
         try {
-            resp = co_await backend->request(std::move(req), st);
+            resp = co_await chain(req, st); // 拦截器链（每跳重新走全链，§5.4）
         } catch (const qjs::js_error&) {
             throw; // JS 异常原样透传
         } catch (const std::exception& e) {
@@ -324,13 +325,22 @@ inline exec::task<qjs::Value> fetch_impl(JSContext* ctx, std::shared_ptr<FetchBa
         }
 
         // 构建 Response（headers guard=response；name 规范化由 append 完成）
-        // SRI：校验响应体摘要（不匹配 → TypeError，reject）
-        check_integrity(ctx, integrity, resp.status, method, resp.body);
+        // SRI（M3）：消费末端增量校验——integrity 非空 → 包 IntegritySource
+        //（read 时算摘要，EOF 比对；不匹配 → 消费 reject TypeError，设计文档 §4.5）。
+        // 空 body（204/205/304/HEAD）仍走立即校验（v1 语义：null body + integrity → TypeError）。
+        std::shared_ptr<BodySource> final_body;
+        if (!integrity.empty() && resp.body) {
+            final_body = std::make_shared<IntegritySource>(std::move(resp.body), integrity);
+        } else {
+            if (!integrity.empty())
+                check_integrity(ctx, integrity, resp.status, method, ""); // null body 检查
+            final_body = std::move(resp.body);
+        }
         ResponseImpl r;
         r.status = resp.status;
         r.status_text = resp.reason;
-        r.body_bytes = std::move(resp.body);
-        r.has_body = true;
+        // 流式 body：204/205/304/HEAD → final_body 为 null → body_stream 为 null
+        r.body_stream = final_body ? make_stream(io_of(ctx), std::move(final_body), st) : nullptr;
         r.type = "basic"; // 同源 fetch 响应（v1 无跨域，恒 basic）
         r.url = url;
         r.redirected = hop > 0; // 规范：经重定向的响应 redirected=true
@@ -345,12 +355,15 @@ inline exec::task<qjs::Value> fetch_impl(JSContext* ctx, std::shared_ptr<FetchBa
 } // namespace fetch_detail
 
 // 安装 fetch 全局函数。backend 由调用方注入（默认实现见 src/net/http_backend）。
-inline void install_fetch(qjs::Context& ctx, std::shared_ptr<FetchBackend> backend) {
+inline void install_fetch(qjs::Context& ctx, std::shared_ptr<FetchBackend> backend,
+                           std::vector<std::shared_ptr<FetchInterceptor>> interceptors) {
     using namespace fetch_detail;
+    // 拦截器链：每跳重走全链（handler 无状态可重用，§5.4）
+    const FetchHandler chain = make_chain(interceptors, backend);
     ctx.globals().set(
         "fetch",
         qjs::func(ctx.raw(),
-                  [backend](qjs::Ctx ctx, qjs::Value input, qjs::Opt<qjs::Value> init)
+                  [backend, chain](qjs::Ctx ctx, qjs::Value input, qjs::Opt<qjs::Value> init)
                       -> exec::task<qjs::Value> {
                       // 同步部分：解析 input/init → RequestImpl
                       RequestImpl req;
@@ -369,11 +382,11 @@ inline void install_fetch(qjs::Context& ctx, std::shared_ptr<FetchBackend> backe
                                   !qjs::Value(ctx.ctx, JS_GetPropertyStr(ctx.ctx, init->raw(), "body"))
                                        .is_undefined();
                               if (!init_has_body) {
-                                  if (src->body_used)
-                                      throw_type_error(ctx.ctx, "fetch: Request body 已被消费");
-                                  // 规范：仅 body 非 null 时才消费（置 bodyUsed）
-                                  if (src->has_body)
-                                      src->body_used = true;
+                                  // 已消费 → TypeError；未消费由 qjs_init 的
+                                  // try_extract_init_body tee 提取（置 input disturbed）
+                                  if (src->body_stream && src->body_stream->disturbed)
+                                      throw_type_error(
+                                          ctx.ctx, "fetch: Request body 已被消费");
                                   input_consumed = true;
                               }
                           }
@@ -430,7 +443,7 @@ inline void install_fetch(qjs::Context& ctx, std::shared_ptr<FetchBackend> backe
                       }
                       // 规范：无 body 的 POST/PUT/PATCH 请求带 Content-Length: 0（undici/浏览器一致）
                       if ((req.method == "POST" || req.method == "PUT" || req.method == "PATCH") &&
-                          !req.has_body)
+                          !req.body_stream)
                           hdrs.push_back({"Content-Length", "0"});
 
                       const std::stop_token st =
@@ -439,8 +452,27 @@ inline void install_fetch(qjs::Context& ctx, std::shared_ptr<FetchBackend> backe
                       if (req.signal && req.signal->aborted)
                           throw qjs::js_error(ctx.ctx, make_abort_error(ctx.ctx).take());
 
-                      co_return co_await fetch_impl(ctx.ctx, backend, req.method, req.url,
-                                                    std::move(hdrs), req.body_bytes,
+                      // 请求 body 读干（fetch 语义：消费 input 的 body；disturbed 已由
+                      // 上面的 input 处理置位，这里实际读取 req 的拷贝流）
+                      std::string body;
+                      if (req.body_stream) {
+                          std::shared_ptr<ReadableStreamImpl> bs = req.body_stream;
+                          try {
+                              for (;;) {
+                                  auto block = co_await bs->read();
+                                  if (!block)
+                                      break;
+                                  body += *block;
+                              }
+                          } catch (const qjs::js_error&) {
+                              throw;
+                          } catch (const std::exception& e) {
+                              throw_type_error(ctx.ctx, "fetch failed: %s", e.what());
+                          }
+                      }
+
+                      co_return co_await fetch_impl(ctx.ctx, backend, chain, req.method,
+                                                    req.url, std::move(hdrs), std::move(body),
                                                     req.redirect, req.integrity, st);
                   },
                   "fetch"));

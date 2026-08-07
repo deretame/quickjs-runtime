@@ -52,6 +52,9 @@ inline qjs::Value js_get(JSContext* ctx, JSValue obj, const char* prop)
 
 inline std::string js_str(JSContext* ctx, JSValue v)
 {
+    // 异常值不转为字符串（pending exception 由调用方/引擎统一处理）
+    if (JS_IsException(v))
+        return {};
     size_t len = 0;
     const char* s = JS_ToCStringLen(ctx, &len, v);
     if (!s)
@@ -410,7 +413,7 @@ inline int64_t type_index(JSContext* ctx, JSValue el)
     std::string name = js_str(ctx, name_v.raw());
     int64_t idx = 0;
     qjs::Value prev = js_get(ctx, el, "prev");
-    while (prev.is_object()) {
+    for (int _g = 0; prev.is_object() && _g < 64; ++_g) {
         if (js_is_element(ctx, prev.raw())) {
             qjs::Value pn = js_get(ctx, prev.raw(), "name");
             if (pn.is_string() && js_str(ctx, pn.raw()) == name)
@@ -437,8 +440,11 @@ struct SelectorMatcher {
     // 从右向左匹配一条 selector 链；el 为当前候选元素。
     // lexbor 语义：selector->combinator = 该 selector 与 prev selector 的关系
     // （CLOSE = 复合段内；CHILD/SIBLING/FOLLOWING/DESCENDANT = 与左边段的关系）。
-    bool match_chain(lxb_css_selector_t* sel, JSValue el)
+    // depth 防 JS 对象环：祖先/兄弟链递归超过上限即失败。
+    bool match_chain(lxb_css_selector_t* sel, JSValue el, int depth = 0)
     {
+        if (depth > 64)
+            return false;
         // 复合段 [head..sel]：段内元素（非 head）的 combinator == CLOSE
         lxb_css_selector_t* head = sel;
         while (head->prev != nullptr && head->combinator == LXB_CSS_SELECTOR_COMBINATOR_CLOSE)
@@ -458,9 +464,9 @@ struct SelectorMatcher {
             case LXB_CSS_SELECTOR_COMBINATOR_DESCENDANT: {
                 // el 的某个祖先匹配左边链（left 作为新的链尾）
                 qjs::Value parent = js_get(ctx, el, "parent");
-                while (parent.is_object()) {
+                for (int _g = 0; parent.is_object() && _g < 64; ++_g) {
                     if (js_is_element(ctx, parent.raw()) &&
-                        match_chain(left, parent.raw()))
+                        match_chain(left, parent.raw(), depth + 1))
                         return true;
                     parent = js_get(ctx, parent.raw(), "parent");
                 }
@@ -470,22 +476,22 @@ struct SelectorMatcher {
                 qjs::Value parent = js_get(ctx, el, "parent");
                 if (!parent.is_object() || !js_is_element(ctx, parent.raw()))
                     return false;
-                return match_chain(left, parent.raw());
+                return match_chain(left, parent.raw(), depth + 1);
             }
             case LXB_CSS_SELECTOR_COMBINATOR_SIBLING: {
                 qjs::Value prev = js_get(ctx, el, "prev");
-                while (prev.is_object()) {
+                for (int _g = 0; prev.is_object() && _g < 64; ++_g) {
                     if (js_is_element(ctx, prev.raw()))
-                        return match_chain(left, prev.raw());
+                        return match_chain(left, prev.raw(), depth + 1);
                     prev = js_get(ctx, prev.raw(), "prev");
                 }
                 return false;
             }
             case LXB_CSS_SELECTOR_COMBINATOR_FOLLOWING: {
                 qjs::Value prev = js_get(ctx, el, "prev");
-                while (prev.is_object()) {
+                for (int _g = 0; prev.is_object() && _g < 64; ++_g) {
                     if (js_is_element(ctx, prev.raw()) &&
-                        match_chain(left, prev.raw()))
+                        match_chain(left, prev.raw(), depth + 1))
                         return true;
                     prev = js_get(ctx, prev.raw(), "prev");
                 }
@@ -616,16 +622,18 @@ struct SelectorMatcher {
         }
     }
 
-    // 元素文本内容（text/script/style 后代拼接）
+    // 元素文本内容（text/script/style 后代拼接）；depth 防环
     std::string text_content(JSValue el)
     {
         std::string out;
-        collect_text(el, out);
+        collect_text(el, out, 0);
         return out;
     }
 
-    void collect_text(JSValue node, std::string& out)
+    void collect_text(JSValue node, std::string& out, int depth)
     {
+        if (depth > 64)
+            return;
         qjs::Value type = js_get(ctx, node, "type");
         if (!type.is_string())
             return;
@@ -643,7 +651,7 @@ struct SelectorMatcher {
                 js_array_length(ctx, children.raw(), &len);
                 for (uint32_t i = 0; i < len; ++i) {
                     qjs::Value c(ctx, JS_GetPropertyUint32(ctx, children.raw(), i));
-                    collect_text(c.raw(), out);
+                    collect_text(c.raw(), out, depth + 1);
                 }
             }
         }
@@ -658,7 +666,7 @@ struct SelectorMatcher {
             case LXB_CSS_SELECTOR_PSEUDO_CLASS_LAST_CHILD: {
                 // el 之后没有元素兄弟
                 qjs::Value next = js_get(ctx, el, "next");
-                while (next.is_object()) {
+                for (int _g = 0; next.is_object() && _g < 64; ++_g) {
                     if (js_is_element(ctx, next.raw()))
                         return false;
                     next = js_get(ctx, next.raw(), "next");
@@ -668,13 +676,13 @@ struct SelectorMatcher {
             case LXB_CSS_SELECTOR_PSEUDO_CLASS_ONLY_CHILD: {
                 // 前后都没有元素兄弟
                 qjs::Value prev = js_get(ctx, el, "prev");
-                while (prev.is_object()) {
+                for (int _g = 0; prev.is_object() && _g < 64; ++_g) {
                     if (js_is_element(ctx, prev.raw()))
                         return false;
                     prev = js_get(ctx, prev.raw(), "prev");
                 }
                 qjs::Value next = js_get(ctx, el, "next");
-                while (next.is_object()) {
+                for (int _g = 0; next.is_object() && _g < 64; ++_g) {
                     if (js_is_element(ctx, next.raw()))
                         return false;
                     next = js_get(ctx, next.raw(), "next");
@@ -687,7 +695,7 @@ struct SelectorMatcher {
                     return false;
                 std::string name = js_str(ctx, name_v.raw());
                 qjs::Value prev = js_get(ctx, el, "prev");
-                while (prev.is_object()) {
+                for (int _g = 0; prev.is_object() && _g < 64; ++_g) {
                     if (js_is_element(ctx, prev.raw())) {
                         qjs::Value pn = js_get(ctx, prev.raw(), "name");
                         if (pn.is_string() && js_str(ctx, pn.raw()) == name)
@@ -703,7 +711,7 @@ struct SelectorMatcher {
                     return false;
                 std::string name = js_str(ctx, name_v.raw());
                 qjs::Value next = js_get(ctx, el, "next");
-                while (next.is_object()) {
+                for (int _g = 0; next.is_object() && _g < 64; ++_g) {
                     if (js_is_element(ctx, next.raw())) {
                         qjs::Value nn = js_get(ctx, next.raw(), "name");
                         if (nn.is_string() && js_str(ctx, nn.raw()) == name)
@@ -785,7 +793,7 @@ struct SelectorMatcher {
                     // 从后数：沿 next 链数元素兄弟（len 含 text/comment，不可用）
                     pos = 1;
                     qjs::Value next = js_get(ctx, el, "next");
-                    while (next.is_object()) {
+                    for (int _g = 0; next.is_object() && _g < 64; ++_g) {
                         if (js_is_element(ctx, next.raw()))
                             ++pos;
                         next = js_get(ctx, next.raw(), "next");
@@ -806,7 +814,7 @@ struct SelectorMatcher {
                     std::string name = js_str(ctx, name_v.raw());
                     int64_t total = 0;
                     qjs::Value next = js_get(ctx, el, "next");
-                    while (next.is_object()) {
+                    for (int _g = 0; next.is_object() && _g < 64; ++_g) {
                         if (js_is_element(ctx, next.raw())) {
                             qjs::Value nn = js_get(ctx, next.raw(), "name");
                             if (nn.is_string() && js_str(ctx, nn.raw()) == name)
@@ -866,9 +874,11 @@ struct SelectorMatcher {
     }
 
     // :has：el 后代中任一节点匹配（含 el 自身？CSS 规范 :has() 匹配后代；
-    // css-select 的 :has 匹配"后代"（不含自身））
-    bool has_descendant_match(lxb_css_selector_list_t* list, JSValue el)
+    // css-select 的 :has 匹配"后代"（不含自身））；depth 防环
+    bool has_descendant_match(lxb_css_selector_list_t* list, JSValue el, int depth = 0)
     {
+        if (depth > 64)
+            return false;
         qjs::Value children = js_get(ctx, el, "children");
         if (!children.is_array())
             return false;
@@ -877,7 +887,7 @@ struct SelectorMatcher {
         for (uint32_t i = 0; i < len; ++i) {
             qjs::Value c(ctx, JS_GetPropertyUint32(ctx, children.raw(), i));
             if (js_is_element(ctx, c.raw()) &&
-                (match_any_list(list, c.raw()) || has_descendant_match(list, c.raw())))
+                (match_any_list(list, c.raw()) || has_descendant_match(list, c.raw(), depth + 1)))
                 return true;
         }
         return false;
@@ -952,7 +962,10 @@ inline qjs::Value lexbor_query_all(qjs::Ctx ctx, qjs::Value root, std::string se
         for (uint32_t i = 0; i < len; ++i)
             stack.push_back(qjs::Value(jctx, JS_GetPropertyUint32(jctx, children.raw(), i)));
     }
-    while (!stack.empty()) {
+    // 节点计数上限：防 JS 对象环导致 DFS 死循环（正常文档树远小于此值）
+    constexpr uint32_t kMaxNodes = 100000;
+    uint32_t visited = 0;
+    while (!stack.empty() && visited++ < kMaxNodes) {
         qjs::Value node = std::move(stack.back());
         stack.pop_back();
         if (js_is_element(jctx, node.raw())) {

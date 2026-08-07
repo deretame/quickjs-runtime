@@ -1,7 +1,7 @@
-﻿// qjsbind::web —— Request / Response（fetch 规范 v1 边界）
+// qjsbind::web —— Request / Response（fetch 规范 v1 边界）
 //
 // body 支持：string / ArrayBuffer / TypedArray / URLSearchParams / undefined；
-// 消费：text() / json() / arrayBuffer()；不做 blob() / formData() / ReadableStream。
+// 消费：text() / json() / arrayBuffer() / formData()；不做 blob() / ReadableStream。
 // Request 相对 URL 以 globalThis.location.href 为 base（无 location 时仅绝对 URL）。
 #pragma once
 
@@ -17,6 +17,7 @@
 #include <exec/task.hpp>
 
 #include <optional>
+#include <cstdlib>
 #include <string>
 #include <utility>
 #include <vector>
@@ -52,6 +53,8 @@ inline ExtractedBody extract_body(JSContext* ctx, JSValueConst body) {
         if (!units)
             throw qjs::js_error(ctx, JS_GetException(ctx));
         out.bytes = utf16_to_utf8(units, len);
+        // 规范：string body 默认 Content-Type
+        out.content_type = "text/plain;charset=UTF-8";
         JS_FreeCStringUTF16(ctx, units);
         return out;
     }
@@ -61,11 +64,40 @@ inline ExtractedBody extract_body(JSContext* ctx, JSValueConst body) {
         out.content_type = "application/x-www-form-urlencoded;charset=UTF-8";
         return out;
     }
-    if (JS_GetTypedArrayType(body) >= 0 || JS_IsArrayBuffer(body)) {
+    if (JS_GetTypedArrayType(body) >= 0 || JS_IsArrayBuffer(body) || JS_IsDataView(body)) {
         out.bytes = js_bytes_from(ctx, body);
         return out;
     }
-    throw_type_error(ctx, "body: 不支持的 body 类型");
+    if (try_blob_bytes(ctx, body, out.bytes)) {
+        // Blob/File：Content-Type 取自 type（规范：body 是 Blob 时自动设置）
+        if (is_blob_instance(ctx, body))
+            out.content_type = qjs::registry_of(ctx).opaque<BlobImpl>(ctx, body)->type;
+        else if (is_file_instance(ctx, body))
+            out.content_type = qjs::registry_of(ctx).opaque<FileImpl>(ctx, body)->blob.type;
+        return out;
+    }
+    if (is_form_data_instance(ctx, body)) {
+        // FormData → multipart/form-data（随机 boundary；规范语义）
+        const auto* fd = qjs::registry_of(ctx).opaque<FormDataImpl>(ctx, body);
+        static const char* hexd = "0123456789abcdef";
+        std::string boundary = "----qjsformdata";
+        for (int i = 0; i < 16; ++i)
+            boundary.push_back(hexd[(rand() >> 4) & 15]);
+        out.bytes = encode_multipart(*fd, boundary);
+        out.content_type = "multipart/form-data; boundary=" + boundary;
+        return out;
+    }
+    // 其他值（对象/数字/布尔等）：ToString 后按字符串处理（fetch 规范 body 提取；wpt request-init-002）
+    {
+        size_t len = 0;
+        const uint16_t* units = JS_ToCStringLenUTF16(ctx, &len, body);
+        if (!units)
+            throw qjs::js_error(ctx, JS_GetException(ctx)); // Symbol 等 → TypeError
+        out.bytes = utf16_to_utf8(units, len);
+        out.content_type = "text/plain;charset=UTF-8";
+        JS_FreeCStringUTF16(ctx, units);
+        return out;
+    }
 }
 
 // 消费字节：text / json / arrayBuffer
@@ -78,7 +110,12 @@ inline qjs::Value consume_text(JSContext* ctx, const std::string& bytes) {
     return qjs::Value(ctx, JS_NewStringLen(ctx, s.data(), s.size()));
 }
 inline qjs::Value consume_json(JSContext* ctx, const std::string& bytes) {
-    JSValue v = JS_ParseJSON(ctx, bytes.data(), bytes.size(), "<json>");
+    // 规范：JSON 解析前先做 UTF-8 decode（去 BOM）——wpt json.any.js
+    std::string s = bytes;
+    if (s.size() >= 3 && static_cast<uint8_t>(s[0]) == 0xEF &&
+        static_cast<uint8_t>(s[1]) == 0xBB && static_cast<uint8_t>(s[2]) == 0xBF)
+        s.erase(0, 3);
+    JSValue v = JS_ParseJSON(ctx, s.data(), s.size(), "<json>");
     if (JS_IsException(v))
         throw qjs::js_error(ctx, JS_GetException(ctx));
     return qjs::Value(ctx, v);
@@ -117,6 +154,7 @@ struct RequestImpl {
     bool has_body = false;
     bool body_used = false;
     std::string redirect = "follow";
+    std::string integrity;            // SRI 元数据（空 = 不校验）
     AbortSignalImpl* signal = nullptr; // 借用（signal JS 对象持有）
     qjs::RtValue signal_js;            // 持有 signal JS 引用（fetch 取消用）
     qjs::RtValue headers_js;           // 缓存的 Headers JS 对象（同一对象语义）
@@ -125,7 +163,8 @@ struct RequestImpl {
     // 拷贝：signal 不复制（fetch 规范：Request clone 不继承 signal）
     RequestImpl(const RequestImpl& o)
         : method(o.method), url(o.url), headers(o.headers), body_bytes(o.body_bytes),
-          has_body(o.has_body), body_used(o.body_used), redirect(o.redirect), signal(nullptr) {}
+          has_body(o.has_body), body_used(o.body_used), redirect(o.redirect),
+          integrity(o.integrity), signal(nullptr) {}
     RequestImpl& operator=(const RequestImpl& o) {
         method = o.method;
         url = o.url;
@@ -134,6 +173,7 @@ struct RequestImpl {
         has_body = o.has_body;
         body_used = o.body_used;
         redirect = o.redirect;
+        integrity = o.integrity;
         signal = nullptr;
         signal_js = qjs::RtValue(); // 释放旧引用（若有）
         headers_js = qjs::RtValue();
@@ -212,16 +252,49 @@ struct RequestImpl {
                 body_bytes = std::move(b.bytes);
                 has_body = b.has;
                 body_used = false; // 覆盖后重置（input 拷贝可能已消费）
-                if (!b.content_type.empty())
+                if (!b.content_type.empty() && !headers.has(ctx, "Content-Type"))
                     headers.append(ctx, "Content-Type", b.content_type);
             }
             qjs::Value redirect = obj.get("redirect");
             if (!redirect.is_undefined())
                 this->redirect = normalize_redirect(ctx, redirect.as<std::string>());
             qjs::Value integrity = obj.get("integrity");
-            if (!integrity.is_undefined() && !integrity.is_null() &&
-                !integrity.as<std::string>().empty())
-                throw_type_error(ctx, "Request: integrity 未实现");
+            if (!integrity.is_undefined() && !integrity.is_null()) {
+                // SRI 元数据解析（fetch 规范 §4.7）：空格分隔项，每项 algo-base64；
+                // 算法必须 sha256/sha384/sha512，digest 为 base64（标准或 url-safe，可去 padding）
+                const std::string meta = integrity.as<std::string>();
+                auto check_item = [](const std::string& item) -> bool {
+                    const size_t dash = item.find('-');
+                    if (dash == std::string::npos || dash + 1 >= item.size())
+                        return false;
+                    const std::string algo = item.substr(0, dash);
+                    if (algo != "sha256" && algo != "sha384" && algo != "sha512")
+                        return false;
+                    for (size_t i = dash + 1; i < item.size(); ++i) {
+                        const char c = item[i];
+                        if (!(std::isalnum(static_cast<unsigned char>(c)) || c == '+' || c == '/' ||
+                              c == '-' || c == '_' || c == '='))
+                            return false;
+                    }
+                    return true;
+                };
+                bool ok = true;
+                std::string cur;
+                for (const char c : meta + " ") {
+                    if (c == ' ') {
+                        if (!cur.empty() && !check_item(cur)) {
+                            ok = false;
+                            break;
+                        }
+                        cur.clear();
+                    } else {
+                        cur.push_back(c);
+                    }
+                }
+                if (!ok)
+                    throw_type_error(ctx, "Request: integrity 元数据非法");
+                this->integrity = meta;
+            }
             qjs::Value signal_v = obj.get("signal");
             if (!signal_v.is_undefined() && !signal_v.is_null()) {
                 auto& reg = qjs::registry_of(ctx);
@@ -344,6 +417,7 @@ inline void install_request(qjs::Context& ctx) {
                        return qjs::Value(ctx.ctx, JS_NULL);
                    })
                    .getter("redirect", [](qjs::This<RequestImpl> self) { return self->redirect; })
+                   .getter("integrity", [](qjs::This<RequestImpl> self) { return self->integrity; })
                    .getter("signal", [](qjs::Ctx ctx, qjs::This<RequestImpl> self) -> qjs::Value {
                        if (self->signal_js.empty())
                            return qjs::Value(ctx.ctx, JS_UNDEFINED);
@@ -365,7 +439,21 @@ inline void install_request(qjs::Context& ctx) {
                    .method("arrayBuffer", [](qjs::Ctx ctx, qjs::This<RequestImpl> self)
                                -> exec::task<qjs::Value> {
                        co_return consume_impl(ctx.ctx, *self, "Request", consume_array_buffer);
-                   });
+                   })
+                   .method("formData",
+                           [](qjs::Ctx ctx, qjs::This<RequestImpl> self) -> exec::task<qjs::Value> {
+                               const std::string ct =
+                                   self->headers.get(ctx.ctx, "content-type").value_or("");
+                               co_return consume_impl(
+                                   ctx.ctx, *self, "Request",
+                                   [ct](JSContext* ctx, const std::string& bytes) -> qjs::Value {
+                                       auto fd = parse_multipart(bytes, extract_boundary(ct));
+                                       if (!fd) // 解析失败 → TypeError（wpt invalidCases）
+                                           throw_type_error(ctx, "Request: multipart/form-data 解析失败");
+                                       return qjs::Value(
+                                           ctx, qjs::js_convert<FormDataImpl>::to_js(ctx, *fd));
+                                   });
+                           });
     ctx.globals().set("Request", cls.constructor_function());
 }
 
@@ -454,6 +542,8 @@ struct ResponseImpl {
             ExtractedBody b = extract_body(ctx, body->raw());
             body_bytes = std::move(b.bytes);
             has_body = b.has;
+            if (!b.content_type.empty() && !headers.has(ctx, "Content-Type"))
+                headers.append(ctx, "Content-Type", b.content_type); // 规范：Blob/URLSearchParams 自动设置
         }
         // 规范：204/205/304 无 body
         if (status == 204 || status == 205 || status == 304)
@@ -480,6 +570,14 @@ inline bool try_extract_init_body(JSContext* ctx, JSValueConst v, ExtractedBody&
             throw_type_error(ctx, "Response: body 已被消费");
         out.bytes = r->body_bytes;
         out.has = r->has_body;
+        return true;
+    }
+    if (try_blob_bytes(ctx, v, out.bytes)) { // Blob/File 作 init
+        out.has = true;
+        if (is_blob_instance(ctx, v))
+            out.content_type = reg.opaque<BlobImpl>(ctx, v)->type;
+        else if (is_file_instance(ctx, v))
+            out.content_type = reg.opaque<FileImpl>(ctx, v)->blob.type;
         return true;
     }
     return false;
@@ -523,6 +621,20 @@ inline void install_response(qjs::Context& ctx) {
                                -> exec::task<qjs::Value> {
                        co_return consume_impl(ctx.ctx, *self, "Response", consume_array_buffer);
                    })
+                   .method("formData",
+                           [](qjs::Ctx ctx, qjs::This<ResponseImpl> self) -> exec::task<qjs::Value> {
+                               const std::string ct =
+                                   self->headers.get(ctx.ctx, "content-type").value_or("");
+                               co_return consume_impl(
+                                   ctx.ctx, *self, "Response",
+                                   [ct](JSContext* ctx, const std::string& bytes) -> qjs::Value {
+                                       auto fd = parse_multipart(bytes, extract_boundary(ct));
+                                       if (!fd) // 解析失败 → TypeError（wpt invalidCases）
+                                           throw_type_error(ctx, "Response: multipart/form-data 解析失败");
+                                       return qjs::Value(
+                                           ctx, qjs::js_convert<FormDataImpl>::to_js(ctx, *fd));
+                                   });
+                           })
                    .static_method("error", [](qjs::Ctx ctx) -> qjs::Value {
                        ResponseImpl r;
                        r.status = 0;
@@ -542,28 +654,10 @@ inline void install_response(qjs::Context& ctx) {
                        return qjs::Value(ctx.ctx, qjs::js_convert<ResponseImpl>::to_js(ctx.ctx, r));
                    });
     ctx.globals().set("Response", cls.constructor_function());
-    // 迭代器对象（快照语义；活迭代器/删除语义不在 v1 范围）+ getSetCookie 已绑定
+    // forEach 的 container 参数包装（headers 实例；活迭代器补丁见 install_headers）
     ctx.eval(
-        "var __hs = Headers.prototype;"
-        "var __e0 = __hs.entries, __k0 = __hs.keys, __v0 = __hs.values;"
-        "var __iterProto = Object.create(Object.getPrototypeOf(Object.getPrototypeOf([].values())));"
-        "__iterProto.next = function () {"
-        "  return this.__i < this.__arr.length"
-        "    ? {value: this.__arr[this.__i++], done: false}"
-        "    : {value: undefined, done: true};"
-        "};"
-        "__iterProto[Symbol.iterator] = function () { return this; };"
-        "function __mkIter(arr) {"
-        "  var it = Object.create(__iterProto);"
-        "  it.__arr = arr;"
-        "  it.__i = 0;"
-        "  return it;"
-        "}"
-        "__hs.entries = function () { return __mkIter(__e0.call(this)); };"
-        "__hs.keys = function () { return __mkIter(__k0.call(this)); };"
-        "__hs.values = function () { return __mkIter(__v0.call(this)); };"
-        "var __f0 = __hs.forEach;"
-        "__hs.forEach = function (cb, thisArg) {"
+        "var __f0 = Headers.prototype.forEach;"
+        "Headers.prototype.forEach = function (cb, thisArg) {"
         "  var self = this;"
         "  __f0.call(this, function (value, key) { cb.call(thisArg, value, key, self); }, thisArg);"
         "};");

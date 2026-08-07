@@ -53,8 +53,6 @@ DIR_SKIP = (
 
 # ---- 内容级规则：未实现的 JS API（\b 边界，避免误匹配注释里的词）----
 JS_API_SKIP = [
-    (r"\bnew\s+Blob\b", "Blob 未实现"),
-    (r"\bnew\s+FormData\b", "FormData 未实现"),
     (r"\bReadableStream\b", "ReadableStream 未实现"),
     (r"\bnew\s+Worker\b", "Worker 未实现"),
     (r"\bServiceWorker\b", "ServiceWorker 未实现"),
@@ -70,8 +68,7 @@ JS_API_SKIP = [
     (r"\bdocument\.", "DOM document 未实现"),
     (r"\bwindow\.open\b", "window.open 未实现"),
     (r"\bgetReader\s*\(", "body 流（getReader）未实现"),
-    (r"\.blob\s*\(", "response.blob() 未实现"),
-    (r"\.formData\s*\(", "response.formData() 未实现"),
+    (r"\.blob\s*\(", "response/request.blob() 未实现"),
     (r"\bMediaSource\b", "MediaSource 未实现"),
     # RequestInit 未实现字段
     (r"['\"]integrity['\"]\s*:", "integrity 未实现"),
@@ -83,8 +80,6 @@ JS_API_SKIP = [
     (r"['\"]referrerPolicy['\"]\s*:|\breferrerPolicy\s*:", "referrerPolicy 未实现"),
     (r"['\"]referrer['\"]\s*:|\breferrer\s*:", "referrer 未实现"),
     (r"mode\s*:\s*['\"](?:no-cors|cors)['\"]", "CORS/no-cors 模式未实现"),
-    # data: URL（fetch data: scheme 未实现）
-    (r"['\"]data:", "data: URL scheme 未实现"),
     # Response.json 静态方法未实现
     (r"Response\s*\.\s*json\s*\(", "Response.json() 未实现"),
 ]

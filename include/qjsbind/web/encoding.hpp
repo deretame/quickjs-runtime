@@ -38,7 +38,7 @@ struct TextDecoderImpl {
     }
 };
 
-// 从 JS 值提取字节（TypedArray/ArrayBuffer → 拷贝；其他 → TypeError）
+// 从 JS 值提取字节（TypedArray/ArrayBuffer/DataView → 拷贝；其他 → TypeError）
 inline std::string js_bytes_from(JSContext* ctx, JSValueConst v) {
     if (JS_GetTypedArrayType(v) >= 0) {
         size_t byte_offset = 0, byte_length = 0, bytes_per_element = 0;
@@ -56,6 +56,20 @@ inline std::string js_bytes_from(JSContext* ctx, JSValueConst v) {
         size_t size = 0;
         uint8_t* data = JS_GetArrayBuffer(ctx, &size, v);
         return std::string(reinterpret_cast<const char*>(data), size);
+    }
+    if (JS_IsDataView(v)) {
+        // DataView：quickjs 无公开底层 API，经 buffer/byteOffset/byteLength 属性读取
+        qjs::Value buf(ctx, JS_GetPropertyStr(ctx, v, "buffer"));
+        qjs::Value off(ctx, JS_GetPropertyStr(ctx, v, "byteOffset"));
+        qjs::Value len(ctx, JS_GetPropertyStr(ctx, v, "byteLength"));
+        if (buf.is_exception())
+            throw qjs::js_error(ctx, JS_GetException(ctx));
+        size_t size = 0;
+        uint8_t* data = JS_GetArrayBuffer(ctx, &size, buf.raw());
+        if (!data)
+            throw qjs::js_error(ctx, JS_GetException(ctx));
+        return std::string(reinterpret_cast<const char*>(data) + off.as<std::size_t>(),
+                           len.as<std::size_t>());
     }
     throw_type_error(ctx, "TypeError: 参数不是字节数组");
 }

@@ -11,14 +11,13 @@
   // 已知 v1 限制（快照迭代器 vs 活迭代器、裸 %、data: URL、自定义迭代器）
   // 命中这些测试名的失败记为 expected，不计入 fail
   var expectedFailures = [
-    'Removing elements already iterated',
-    'Prepending a value pair before the current element',
-    'Iteration skips elements removed while iterating',
-    'Appending a value pair during iteration',
-    'Headers iterator is correctly updated with set-cookie changes',
+    // 自定义迭代器：new Headers(existing) 走实例 Symbol.iterator（fetch 规范细节）
+    'Create headers with existing headers with custom iterator',
+    // boost 严格 URL 语法：裸 % 被编码为 %25（安全特性，见 fetch_design.md）
     'Escaping produces double-percent',
-    'Ensure the correct JSON parser is used',
-    'Create headers with existing headers with custom iterator'
+    // response/request.blob() 未实现（v1 边界；body 消费方法仅 text/json/arrayBuffer/formData）
+    'Calling blob()',
+    'Aborting a request after calling blob()'
   ];
   function isExpectedFail(name) {
     return expectedFailures.some(function (p) { return String(name).indexOf(p) !== -1; });

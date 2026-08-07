@@ -1,4 +1,4 @@
-// loop.hpp —— 事件循环：Runtime::spawn / run / stop / shutdown / pump_js_jobs
+﻿// loop.hpp —— 事件循环：Runtime::spawn / run / stop / shutdown / pump_js_jobs
 //
 // 设计文档 §8：
 //   - 退出判据 = pending_ 计数（Runtime::spawn +1、三路收尾 -1），不用 on_empty
@@ -24,7 +24,7 @@ template <stdexec::sender S>
 void Runtime::spawn(S&& sndr)
 {
     pending_.fetch_add(1, std::memory_order_relaxed);
-    scope_.spawn(
+    scope_->spawn(
         std::forward<S>(sndr)
             | stdexec::then([this](auto&&...) noexcept { complete(); })
             | stdexec::upon_error([this](auto&&) noexcept { complete(); })
@@ -99,13 +99,19 @@ inline void Runtime::shutdown()
         return;
     shutdown_done_.store(true, std::memory_order_release);
 
-    scope_.request_stop(); // 1. 通知所有在飞任务（协作式取消）
-    while (pending_.load(std::memory_order_acquire) != 0) { // 2. 驱动到全部结算
-        pump_js_jobs();
-        io_.run_one(); // guard_ 仍在：取消结算必然 post 回 io_
+    if (pending_.load(std::memory_order_acquire) != 0) {
+        scope_->request_stop(); // 1. 仅在确有在飞任务时通知协作式取消
+        while (pending_.load(std::memory_order_acquire) != 0) { // 2. 驱动到全部结算
+            pump_js_jobs();
+            io_.run_one(); // guard_ 仍在：取消结算必然 post 回 io_
+        }
+        pump_js_jobs(); // 3. 收尾 job（AbortError 的 then/catch 链）
     }
-    pump_js_jobs(); // 3. 收尾 job（AbortError 的 then/catch 链）
     guard_.reset(); // 4. 解除保活
+
+    // 5. request_stop 是单向的：重建 scope_（新 stop_source），
+    //    使 run_to_completion 可重复调用（多轮 eval+run 的脚本模式）
+    scope_ = std::make_unique<exec::async_scope>();
 }
 
 } // namespace qjs

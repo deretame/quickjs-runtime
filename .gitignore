@@ -38,3 +38,4 @@ NUL.obj
 # 构建产物
 src/net/cacert_embedded.hpp
 third_party/wpt/
+.clice

@@ -66,7 +66,7 @@ pixi run build
 ├── src/
 │   ├── main.cpp            # 主程序（quickjs-ng + asio + stdexec demo）
 │   └── net/                # fetch 网络层（boost::beast + OpenSSL，静态库 qjsbind_net）
-└── tests/                  # gtest 测试（89 个用例 + wpt 精选子集运行器）
+└── tests/                  # gtest 测试（97 个用例 + wpt 精选子集运行器，656 pass / 0 fail / 6 expected）
 ```
 
 ## 依赖

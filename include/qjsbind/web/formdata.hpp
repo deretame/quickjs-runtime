@@ -1,0 +1,406 @@
+// qjsbind::web —— FormData（WHATWG FormData，Node/浏览器行为一致）
+//
+// v1 边界：
+//   - 构造仅无参（无 DOM form 元素）
+//   - append/set/delete/get/getAll/has/entries/keys/values/forEach/Symbol.iterator
+//   - 值：string 或 Blob/File（Blob + filename → File 语义）
+//   - multipart 序列化（encode_multipart，供 Request body）与解析（parse_multipart，失败 → nullopt → TypeError）
+#pragma once
+
+#include <qjsbind/class.hpp>
+#include <qjsbind/context.hpp>
+#include <qjsbind/value.hpp>
+#include <qjsbind/web/blob.hpp>
+#include <qjsbind/web/errors.hpp>
+#include <qjsbind/web/utf8.hpp>
+
+#include <cstdint>
+#include <optional>
+#include <string>
+#include <utility>
+#include <vector>
+
+namespace qjsbind::web {
+
+// ---------- FormData ----------
+
+struct FormDataImpl {
+    struct Entry {
+        std::string name;
+        std::string bytes;    // 值字节（string 的 UTF-8 或 blob 的原始字节）
+        std::string type;     // blob 值的 type（string 值空）
+        std::string filename; // blob 值的文件名（File.name 或 append 的 filename；string 值空）
+        bool is_blob = false; // true = blob/File 值（get 返回 File 对象）
+    };
+    std::vector<Entry> list;
+
+    void append_entry(std::string name, std::string bytes, std::string type,
+                      std::string filename, bool is_blob) {
+        list.push_back({std::move(name), std::move(bytes), std::move(type),
+                        std::move(filename), is_blob});
+    }
+    // set：替换同名（首个替换值，其余删除；无同名 → append）
+    void set_entry(std::string name, std::string bytes, std::string type,
+                   std::string filename, bool is_blob) {
+        bool replaced = false;
+        for (size_t i = 0; i < list.size();) {
+            if (list[i].name == name) {
+                if (!replaced) {
+                    list[i] = {name, bytes, type, filename, is_blob};
+                    replaced = true;
+                    ++i;
+                } else {
+                    list.erase(list.begin() + static_cast<std::ptrdiff_t>(i));
+                }
+            } else {
+                ++i;
+            }
+        }
+        if (!replaced)
+            append_entry(std::move(name), std::move(bytes), std::move(type),
+                         std::move(filename), is_blob);
+    }
+    void erase_entry(const std::string& name) {
+        std::erase_if(list, [&](const Entry& e) { return e.name == name; });
+    }
+    bool has_entry(const std::string& name) const {
+        for (const auto& e : list)
+            if (e.name == name)
+                return true;
+        return false;
+    }
+};
+
+// 判断 JS 值是否为已绑定的 FormDataImpl 实例
+inline bool is_form_data_instance(JSContext* ctx, JSValueConst v) {
+    if (!JS_IsObject(v))
+        return false;
+    auto& reg = qjs::registry_of(ctx);
+    if (!reg.is_registered<FormDataImpl>())
+        return false;
+    return reg.id_of<FormDataImpl>(ctx) == JS_GetClassID(v);
+}
+
+// JS 值 → FormData 条目（string / Blob / File；filename 参数仅 blob 值生效）
+inline FormDataImpl::Entry form_entry_from(JSContext* ctx, JSValueConst value,
+                                           const std::optional<std::string>& filename) {
+    FormDataImpl::Entry e;
+    if (JS_IsString(value)) {
+        size_t len = 0;
+        const uint16_t* units = JS_ToCStringLenUTF16(ctx, &len, value);
+        if (!units)
+            throw qjs::js_error(ctx, JS_GetException(ctx));
+        e.bytes = utf16_to_utf8(units, len);
+        JS_FreeCStringUTF16(ctx, units);
+        return e;
+    }
+    if (is_file_instance(ctx, value)) {
+        const auto* f = qjs::registry_of(ctx).opaque<FileImpl>(ctx, value);
+        e.bytes = f->blob.bytes;
+        e.type = f->blob.type;
+        e.filename = filename ? *filename : f->name;
+        e.is_blob = true;
+        return e;
+    }
+    if (is_blob_instance(ctx, value)) {
+        const auto* b = qjs::registry_of(ctx).opaque<BlobImpl>(ctx, value);
+        e.bytes = b->bytes;
+        e.type = b->type;
+        e.filename = filename ? *filename : "";
+        e.is_blob = true;
+        return e;
+    }
+    throw_type_error(ctx, "FormData: 值必须是字符串或 Blob/File");
+    return e;
+}
+
+// 条目 → JS 值（get/getAll/迭代：blob 值 → File 对象）
+inline qjs::Value form_entry_to_js(JSContext* ctx, const FormDataImpl::Entry& e) {
+    if (!e.is_blob)
+        return qjs::Value(ctx, JS_NewStringLen(ctx, e.bytes.data(), e.bytes.size()));
+    FileImpl f;
+    f.blob.bytes = e.bytes;
+    f.blob.type = e.type;
+    f.name = e.filename;
+    f.last_modified = 0;
+    return qjs::Value(ctx, qjs::js_convert<FileImpl>::to_js(ctx, f));
+}
+
+// multipart/form-data 序列化（fetch 规范 §multipart/form-data encoding）：
+// --boundary\r\nContent-Disposition: form-data; name="n"[; filename="f"]\r\n
+// [Content-Type: t\r\n]\r\nbytes\r\n--boundary--\r\n
+inline std::string encode_multipart(const FormDataImpl& fd, const std::string& boundary) {
+    std::string out;
+    auto escape = [](const std::string& s) {
+        std::string r;
+        for (const char c : s) {
+            if (c == '"' || c == '\\')
+                r.push_back('\\');
+            r.push_back(c);
+        }
+        return r;
+    };
+    for (const auto& e : fd.list) {
+        out += "--" + boundary + "\r\n";
+        out += "Content-Disposition: form-data; name=\"" + escape(e.name) + "\"";
+        if (e.is_blob)
+            out += "; filename=\"" + escape(e.filename) + "\"";
+        out += "\r\n";
+        if (e.is_blob && !e.type.empty())
+            out += "Content-Type: " + e.type + "\r\n";
+        out += "\r\n";
+        out += e.bytes;
+        out += "\r\n";
+    }
+    out += "--" + boundary + "--\r\n";
+    return out;
+}
+
+// multipart/form-data 解析（fetch 规范 §multipart/form-data parsing；头名大小写不敏感）
+inline std::string extract_boundary(const std::string& content_type) {
+    const std::string key = "boundary=";
+    const size_t p = content_type.find(key);
+    if (p == std::string::npos)
+        return "";
+    size_t b = p + key.size();
+    if (b < content_type.size() && content_type[b] == '"')
+        ++b;
+    size_t e = b;
+    while (e < content_type.size() && content_type[e] != ';' && content_type[e] != '"' &&
+           content_type[e] != ' ' && content_type[e] != '\r' && content_type[e] != '\n')
+        ++e;
+    return content_type.substr(b, e - b);
+}
+
+// Content-Disposition 参数（name/filename）：name="v"（支持 \" 转义）或裸值
+inline std::string parse_disposition_param(const std::string& s, const char* key) {
+    const std::string k = std::string(key) + "=";
+    const size_t p = s.find(k);
+    if (p == std::string::npos)
+        return "";
+    size_t i = p + k.size();
+    if (i < s.size() && s[i] == '"') {
+        ++i;
+        std::string out;
+        while (i < s.size() && s[i] != '"') {
+            if (s[i] == '\\' && i + 1 < s.size())
+                ++i;
+            out.push_back(s[i++]);
+        }
+        return out;
+    }
+    size_t e = i;
+    while (e < s.size() && s[e] != ';' && s[e] != ' ' && s[e] != '\r' && s[e] != '\n')
+        ++e;
+    return s.substr(i, e - i);
+}
+
+// multipart/form-data 解析（HTML 标准 §multipart/form-data parsing algorithm；头名大小写不敏感）。
+// 结构不合法（缺 boundary、delimiter 后非 \r\n、part 无头体分隔等）返回 std::nullopt，
+// 由调用方 reject TypeError（wpt fetch/api/response/response-form-data.html 的 invalidCases）。
+// pos 每轮严格递增，循环保证终止。
+inline std::optional<FormDataImpl> parse_multipart(const std::string& body,
+                                                   const std::string& boundary) {
+    if (boundary.empty())
+        return std::nullopt;
+    FormDataImpl fd;
+    const std::string delim = "--" + boundary;
+    // transport padding（RFC 2046）：delimiter 后允许若干 tab/space
+    auto skip_padding = [&](size_t& p) {
+        while (p < body.size() && (body[p] == ' ' || body[p] == '\t'))
+            ++p;
+    };
+    size_t pos = 0;
+    for (;;) {
+        // 每个 part（含首个）都必须以 --boundary 起始
+        if (body.compare(pos, delim.size(), delim) != 0)
+            return std::nullopt;
+        pos += delim.size();
+        // 结束标记：--boundary "--" [padding] [\r\n] <end>
+        if (body.compare(pos, 2, "--") == 0) {
+            pos += 2;
+            skip_padding(pos);
+            if (body.compare(pos, 2, "\r\n") == 0)
+                pos += 2;
+            if (pos != body.size())
+                return std::nullopt; // 结束标记后还有内容
+            return fd;
+        }
+        // part 起始行：padding 之后必须是 \r\n
+        skip_padding(pos);
+        if (body.compare(pos, 2, "\r\n") != 0)
+            return std::nullopt;
+        pos += 2;
+        // part 内容到下一段边界（\r\n--boundary）为止；不存在 → failure
+        const size_t next = body.find("\r\n" + delim, pos);
+        if (next == std::string::npos)
+            return std::nullopt;
+        const std::string part = body.substr(pos, next - pos);
+        pos = next + 2; // 前进保证：pos 严格递增
+        const size_t hdr_end = part.find("\r\n\r\n");
+        if (hdr_end == std::string::npos)
+            return std::nullopt;
+        const std::string hdrs = part.substr(0, hdr_end);
+        const std::string data = part.substr(hdr_end + 4);
+        // 头行解析（大小写不敏感）
+        std::string disposition, type;
+        size_t hs = 0;
+        while (hs <= hdrs.size()) {
+            const size_t nl = hdrs.find("\r\n", hs);
+            const std::string line =
+                hdrs.substr(hs, nl == std::string::npos ? hdrs.size() - hs : nl - hs);
+            const size_t colon = line.find(':');
+            if (colon != std::string::npos) {
+                std::string name = line.substr(0, colon);
+                std::string value = line.substr(colon + 1);
+                while (!value.empty() && (value.front() == ' ' || value.front() == '\t'))
+                    value.erase(value.begin());
+                for (auto& c : name)
+                    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                if (name == "content-disposition")
+                    disposition = value;
+                else if (name == "content-type")
+                    type = value;
+            }
+            if (nl == std::string::npos)
+                break;
+            hs = nl + 2;
+        }
+        FormDataImpl::Entry e;
+        e.name = parse_disposition_param(disposition, "name");
+        e.filename = parse_disposition_param(disposition, "filename");
+        if (!e.filename.empty() || !type.empty()) {
+            // blob 条目（Content-Disposition 带 filename 或显式 Content-Type）
+            e.bytes = data;
+            e.type = type;
+            e.is_blob = true;
+        } else {
+            // string 条目：UTF-8 decode（去 BOM）
+            std::string s = data;
+            if (s.size() >= 3 && static_cast<uint8_t>(s[0]) == 0xEF &&
+                static_cast<uint8_t>(s[1]) == 0xBB && static_cast<uint8_t>(s[2]) == 0xBF)
+                s.erase(0, 3);
+            e.bytes = s;
+        }
+        fd.list.push_back(std::move(e));
+    }
+}
+
+inline void install_form_data(qjs::Context& ctx) {
+    auto cls = qjs::class_<FormDataImpl>(ctx, "FormData")
+                   .constructor<>()
+                   .method("append",
+                           [](qjs::Ctx ctx, qjs::This<FormDataImpl> self, const std::string& name,
+                              qjs::Value value, qjs::Opt<std::string> filename) {
+                               auto e = form_entry_from(ctx.ctx, value.raw(),
+                                                        filename ? std::optional<std::string>(*filename)
+                                                                 : std::nullopt);
+                               e.name = name;
+                               self->list.push_back(std::move(e));
+                           })
+                   .method("set",
+                           [](qjs::Ctx ctx, qjs::This<FormDataImpl> self, const std::string& name,
+                              qjs::Value value, qjs::Opt<std::string> filename) {
+                               const auto e = form_entry_from(
+                                   ctx.ctx, value.raw(),
+                                   filename ? std::optional<std::string>(*filename)
+                                            : std::nullopt);
+                               // 替换首个同名，删除其余；无同名 → append
+                               bool replaced = false;
+                               for (size_t i = 0; i < self->list.size();) {
+                                   if (self->list[i].name == name) {
+                                       if (!replaced) {
+                                           self->list[i] = e;
+                                           self->list[i].name = name; // e 不含 name
+                                           replaced = true;
+                                           ++i;
+                                       } else {
+                                           self->list.erase(self->list.begin() +
+                                                            static_cast<std::ptrdiff_t>(i));
+                                       }
+                                   } else {
+                                       ++i;
+                                   }
+                               }
+                               if (!replaced) {
+                                   self->list.push_back(e);
+                                   self->list.back().name = name;
+                               }
+                           })
+                   .method("delete",
+                           [](qjs::Ctx ctx, qjs::This<FormDataImpl> self, const std::string& name) {
+                               self->erase_entry(name);
+                           })
+                   .method("has", [](qjs::This<FormDataImpl> self, const std::string& name) {
+                       return self->has_entry(name);
+                   })
+                   .method("get",
+                           [](qjs::Ctx ctx, qjs::This<FormDataImpl> self,
+                              const std::string& name) -> qjs::Value {
+                               for (const auto& e : self->list)
+                                   if (e.name == name)
+                                       return form_entry_to_js(ctx.ctx, e);
+                               return qjs::Value(ctx.ctx, JS_NULL);
+                           })
+                   .method("getAll",
+                           [](qjs::Ctx ctx, qjs::This<FormDataImpl> self,
+                              const std::string& name) -> qjs::Value {
+                               qjs::Array arr(ctx.ctx, JS_NewArray(ctx.ctx));
+                               std::size_t i = 0;
+                               for (const auto& e : self->list)
+                                   if (e.name == name)
+                                       arr.set(i++, form_entry_to_js(ctx.ctx, e));
+                               return qjs::Value(std::move(arr));
+                           })
+                   .method("entries",
+                           [](qjs::Ctx ctx, qjs::This<FormDataImpl> self) -> qjs::Value {
+                               qjs::Array arr(ctx.ctx, JS_NewArray(ctx.ctx));
+                               std::size_t i = 0;
+                               for (const auto& e : self->list) {
+                                   qjs::Array pair(ctx.ctx, JS_NewArray(ctx.ctx));
+                                   pair.set(0, qjs::Value(ctx.ctx, JS_NewString(ctx.ctx, e.name.c_str())));
+                                   pair.set(1, form_entry_to_js(ctx.ctx, e));
+                                   arr.set(i++, qjs::Value(std::move(pair)));
+                               }
+                               return qjs::Value(std::move(arr));
+                           })
+                   .method("keys",
+                           [](qjs::Ctx ctx, qjs::This<FormDataImpl> self) -> qjs::Value {
+                               qjs::Array arr(ctx.ctx, JS_NewArray(ctx.ctx));
+                               std::size_t i = 0;
+                               for (const auto& e : self->list)
+                                   arr.set(i++, qjs::Value(ctx.ctx, JS_NewString(ctx.ctx, e.name.c_str())));
+                               return qjs::Value(std::move(arr));
+                           })
+                   .method("values",
+                           [](qjs::Ctx ctx, qjs::This<FormDataImpl> self) -> qjs::Value {
+                               qjs::Array arr(ctx.ctx, JS_NewArray(ctx.ctx));
+                               std::size_t i = 0;
+                               for (const auto& e : self->list)
+                                   arr.set(i++, form_entry_to_js(ctx.ctx, e));
+                               return qjs::Value(std::move(arr));
+                           })
+                   .method("forEach",
+                           [](qjs::Ctx ctx, qjs::This<FormDataImpl> self, qjs::Function cb,
+                              qjs::Opt<qjs::Value> this_arg) {
+                               for (const auto& e : self->list) {
+                                   JSValue val = form_entry_to_js(ctx.ctx, e).take();
+                                   JSValue args[3] = {val,
+                                                      JS_NewString(ctx.ctx, e.name.c_str()),
+                                                      JS_DupValue(ctx.ctx, this_arg ? this_arg->raw()
+                                                                                   : JS_UNDEFINED)};
+                                   qjs::Value r = cb.call_raw(3, args);
+                                   JS_FreeValue(ctx.ctx, args[0]);
+                                   JS_FreeValue(ctx.ctx, args[1]);
+                                   JS_FreeValue(ctx.ctx, args[2]);
+                                   if (r.is_exception())
+                                       throw qjs::js_error(ctx.ctx, JS_GetException(ctx.ctx));
+                               }
+                           });
+    ctx.globals().set("FormData", cls.constructor_function());
+    ctx.eval(
+        "FormData.prototype[Symbol.iterator] = function* () { yield* this.entries(); };"
+        "FormData.prototype[Symbol.toStringTag] = 'FormData';");
+}
+
+} // namespace qjsbind::web

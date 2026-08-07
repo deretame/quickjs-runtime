@@ -81,6 +81,7 @@ template <class T>
 struct This {
     using element_type = T;
     T* ptr;
+    JSValueConst js = JS_UNDEFINED; // 本次调用的 this JS 值（联动/回写场景用）
     T* operator->() const noexcept { return ptr; }
     T& operator*() const noexcept { return *ptr; }
 };
@@ -257,7 +258,7 @@ decltype(auto) convert_arg(JSContext* ctx, JSValueConst this_val, int argc, JSVa
         return Ctx{ctx};
     } else if constexpr (is_this_param<A>::value) {
         using T = typename A::element_type;
-        return A{registry_of(ctx).opaque<T>(ctx, this_val)};
+        return A{registry_of(ctx).opaque<T>(ctx, this_val), this_val};
     } else if constexpr (is_opt_param<A>::value) {
         using T = typename A::value_type;
         if (offset < static_cast<std::size_t>(argc))

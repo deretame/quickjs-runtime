@@ -277,15 +277,23 @@
 - **状态**：已规避。
 
 ### KI-054 ● Windows 环境隐形坑（fetch 里程碑实测）
-- `std::ifstream` 打不开混合分隔符路径（`D:\...untime/third_party/...`，errno=22）→ 用 `std::fopen`
+- `std::ifstream` 打不开混合分隔符路径（`D:\...
+untime/third_party/...`，errno=22）→ 用 `std::fopen`
 - Windows 被拒端口（127.0.0.1:1 等）静默丢包，connect 挂起 → 必须实现 blocked-port 构造检查（fetch 规范）
 - python `open("w")` 在 Windows 写 CRLF → `std::getline` 残留 `\r` 污染 meta 路径 → 写清单用 `newline="
 "` + 解析端防御 strip
 - **状态**：已规避（wpt_runner/analyze_wpt.py/http_client 均含规避代码）。
 
-### KI-055 ○ wpt 精选子集 9 个 expected（v1 已知限制）
-- 活迭代器语义（迭代中删除/追加元素）6 个：v1 迭代器是快照（JS 补丁基于 entries 数组）
-- 裸 `%` 在 query 的 WHATWG 保留语义（boost 无法表示）
-- `data:` URL 的 fetch 未实现
-- Headers 实例构造走内部拷贝（不走自定义迭代器）
+### KI-055 ○ wpt 精选子集 6 个 expected（v1 已知限制）
+- 裸 `%` 在 query 的 WHATWG 保留语义（boost 无法表示）：1 个
+- Request/Response 的 `blob()` 未实现（body 消费仅 text/json/arrayBuffer/formData）：4 个
+- Headers 实例构造走内部拷贝（不走自定义迭代器）：1 个
 - **状态**：设计规避（shim 内登记 expected，套件保持 0 fail）。
+- **历史**：活迭代器、`data:` URL fetch、Blob/FormData、integrity、URLSearchParams 双向联动均已实现，从 expected 移除。
+
+### KI-056 ★ parse_multipart 死循环：跳过畸形 part 时位置未推进
+- **现象**：`Response.formData()` 遇到 delimiter 后非 `\r\n` 的输入（如孤立 `\n`、`\r`、垃圾字节）时卡死——wpt response-form-data.html 第 3 个 promise_test 必现；表象是"第 3 次 spawn 卡死"，实为该用例的输入触发。
+- **原因**：旧解析器对无 `\r\n\r\n` 头体分隔的 part 走 `continue`，但找下一个 boundary 的位置变量未更新（`d = next` 在循环尾被 `continue` 跳过），原地死循环。
+- **规避**：按 HTML 标准 multipart/form-data parsing algorithm 重写——pos 每轮严格递增保证终止；delimiter 后仅允许 transport padding（tab/space）+ `\r\n`，结束标记 `--` 之后必须到输入末尾；结构不合法返回 `std::nullopt`，调用方 reject TypeError。
+- **状态**：已修复（wpt response-form-data.html 14/14 全过）。
+- **教训**："第 N 次并发操作卡死"未必是并发/异步层问题——先把每个操作换成相同输入做对照，排除数据相关的确定性死循环，再往 stdexec/调度层挖。

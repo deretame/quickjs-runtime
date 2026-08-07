@@ -398,11 +398,50 @@ inline void install_headers(qjs::Context& ctx) {
                                    if (r.is_exception())
                                        throw qjs::js_error(ctx.ctx, JS_GetException(ctx.ctx));
                                }
+                           })
+                   // 活迭代器支撑：返回当前第 index 个 sorted entry（[name, value]）或 null。
+                   // 迭代器每次 next 动态读取 → 迭代期间的增删自动反映（wpt headers-basic 活迭代语义）
+                   .method("_entryAt",
+                           [](qjs::Ctx ctx, qjs::This<HeadersImpl> self, int index) -> qjs::Value {
+                               const auto entries = self->sorted_entries();
+                               if (index < 0 || index >= static_cast<int>(entries.size()))
+                                   return qjs::Value(ctx.ctx, JS_NULL);
+                               qjs::Array pair(ctx.ctx, JS_NewArray(ctx.ctx));
+                               pair.set(0, qjs::Value(ctx.ctx,
+                                                      JS_NewString(ctx.ctx, entries[index].first.c_str())));
+                               pair.set(1, qjs::Value(ctx.ctx,
+                                                      JS_NewString(ctx.ctx, entries[index].second.c_str())));
+                               return qjs::Value(std::move(pair));
                            });
     ctx.globals().set("Headers", cls.constructor_function());
-    // Symbol.iterator（vcpkg quickjs.h 无公共 atom 常量，JS 侧补丁最稳）
+    // 活迭代器：自定义迭代器原型（基于 %IteratorPrototype%），next 动态读 _entryAt
+    // → 迭代期间 append/delete 实时反映（规范 live 语义）；next 属性描述符
+    // enumerable/configurable/writable=true（wpt checkIteratorProperties 要求）。
     ctx.eval(
-        "Headers.prototype[Symbol.iterator] = function* () { yield* this.entries(); };"
+        "var __iterBase = Object.getPrototypeOf(Object.getPrototypeOf([].values()));"
+        "var __hIterProto = Object.create(__iterBase);"
+        "Object.defineProperty(__hIterProto, 'next', {"
+        "  configurable: true, enumerable: true, writable: true,"
+        "  value: function () {"
+        "    var e = this.__h._entryAt(this.__i);"
+        "    this.__i++;"
+        "    if (e === null) return {done: true, value: undefined};"
+        "    if (this.__k === 0) return {done: false, value: [e[0], e[1]]};"
+        "    if (this.__k === 1) return {done: false, value: e[0]};"
+        "    return {done: false, value: e[1]};"
+        "  }"
+        "});"
+        "__hIterProto[Symbol.iterator] = function () { return this; };"
+        "function __mkHIter(h, i, k) {"
+        "  var it = Object.create(__hIterProto);"
+        "  it.__h = h; it.__i = i; it.__k = k;"
+        "  return it;"
+        "}"
+        "var __hs = Headers.prototype;"
+        "__hs.entries = function () { return __mkHIter(this, 0, 0); };"
+        "__hs.keys = function () { return __mkHIter(this, 0, 1); };"
+        "__hs.values = function () { return __mkHIter(this, 0, 2); };"
+        "Headers.prototype[Symbol.iterator] = Headers.prototype.entries;"
         "Headers.prototype[Symbol.toStringTag] = 'Headers';");
 }
 

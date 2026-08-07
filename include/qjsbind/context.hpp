@@ -219,7 +219,8 @@ private:
     JSRuntime* rt_ = nullptr;
     JSContext* ctx_ = nullptr;
     boost::asio::io_context io_; // 见设计文档 §5/§8（成员声明顺序保证销毁次序）
-    exec::async_scope scope_;
+    // scope_ 在 shutdown() 后重建（request_stop 单向，见 loop.hpp）
+    std::unique_ptr<exec::async_scope> scope_ = std::make_unique<exec::async_scope>();
     std::atomic<std::ptrdiff_t> pending_{0};
     std::atomic<bool> done_{false};
     std::atomic<bool> shutdown_done_{false};

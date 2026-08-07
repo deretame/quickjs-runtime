@@ -25,11 +25,13 @@ JS (quickjs-ng) ── qjsbind 绑定层 ── qjsbind::web（header-only）
 | 类 | 成员 | 备注 |
 |---|---|---|
 | fetch | `fetch(input, init)` | redirect follow≤20/error/manual；响应 type="basic"；forbidden 请求头过滤；blocked port |
-| Headers | 构造（record/序列/实例/undefined/null→TypeError）、append/set/delete/get/has/forEach/entries/keys/values/getSetCookie、Symbol.iterator | guard：none/request/request-no-cors/response/immutable；forbidden 静默忽略（immutable 抛）；同名多值存储（set-cookie 语义）；迭代 sort+combine；迭代器为快照（活迭代器限制见 §5） |
-| Request | method/url/headers/redirect/signal/body/bodyUsed、clone、text/json/arrayBuffer | body：string/ArrayBuffer/TypedArray/URLSearchParams/Request/Response 实例；method 规范化；GET/HEAD 禁 body；integrity 未实现（抛 TypeError） |
-| Response | status/statusText/type/url/redirected/ok/headers/body/bodyUsed、text/json/arrayBuffer、clone、error()、redirect() | 204/205/304 无 body（带 body 抛 TypeError）；status 非法 RangeError；statusText ByteString 检查；error() 的 headers guard=immutable |
-| URL | 各属性、searchParams、toString/href、静态 parse 未实现 | boost::urls；相对解析带 base；宽松解析（非 ASCII/`|`/裸 `%` → WHATWG 编码重试）；UTF-16 转换（孤立代理→U+FFFD）；searchParams 双向联动未实现 |
-| URLSearchParams | 构造/增删查改/sort/entries/keys/values/Symbol.iterator | |
+| Headers | 构造（record/序列/实例/undefined/null→TypeError）、append/set/delete/get/has/forEach/entries/keys/values/getSetCookie、Symbol.iterator | guard：none/request/request-no-cors/response/immutable；forbidden 静默忽略（immutable 抛）；同名多值存储（set-cookie 语义）；迭代 sort+combine；活迭代器（迭代中增删反映，读内部 list） |
+| Request | method/url/headers/redirect/signal/body/bodyUsed、clone、text/json/arrayBuffer/formData | body：string/ArrayBuffer/TypedArray/DataView/URLSearchParams/Blob/File/FormData/Request/Response 实例、其他值 ToString；method 规范化；GET/HEAD 禁 body；integrity：sha256/384/512 校验；blob() 未实现 |
+| Response | status/statusText/type/url/redirected/ok/headers/body/bodyUsed、text/json/arrayBuffer/formData、clone、error()、redirect() | 204/205/304 无 body（带 body 抛 TypeError）；status 非法 RangeError；statusText ByteString 检查；error() 的 headers guard=immutable；formData() 走 multipart 解析；blob() 未实现 |
+| URL | 各属性、searchParams、toString/href、静态 parse 未实现 | boost::urls；相对解析带 base；宽松解析（非 ASCII/`|`/裸 `%` → WHATWG 编码重试）；UTF-16 转换（孤立代理→U+FFFD）；searchParams 双向联动（SameObject 缓存 + 回写） |
+| URLSearchParams | 构造/增删查改/sort/entries/keys/values/Symbol.iterator | 双向联动：owner URL 回写（append/delete/set/sort） |
+| Blob/File | 构造（parts/type/lastModified）、size/type/name、slice、text/arrayBuffer | Blob 惰性拼接；File 继承 Blob（name/lastModified） |
+| FormData | 构造（form/record/无参）、append/delete/get/getAll/has/set、entries/keys/values/Symbol.iterator | 迭代返回数组（非规范迭代器对象）；boundary 随机生成 |
 | AbortController/Signal | abort()/signal/aborted/onabort | 协程取消链路 |
 | TextEncoder/Decoder | encode/decode、构造 options（fatal/ignoreBOM） | decode 默认剥离 UTF-8 BOM |
 | 其他 | setTimeout/setInterval/clearTimeout/clearInterval、DOMException、Event/EventTarget | |
@@ -58,11 +60,9 @@ python scripts/analyze_wpt.py
 cd build && ./quickjs_runtime_tests.exe --gtest_filter="WptRunner.*"
 ```
 
-## 5. 已知限制（v1，9 个 expected + 清单 skip）
+## 5. 已知限制（v1，6 个 expected + 清单 skip）
 
-- **活迭代器**：Headers 迭代器为快照（基于 entries 数组），迭代中删除/追加元素不反映（wpt 6 个用例 expected）
-- **裸 `%`**：query 中 WHATWG 保留裸 `%`，boost 严格语法无法表示（1 个）
-- **`data:` URL**：fetch 仅支持 http/https（1 个）
-- **自定义迭代器**：`new Headers(existingHeaders)` 走内部拷贝，不走自定义迭代器（1 个）
-- 清单级 skip：`.sub` 模板、`.https`、worker、credentials/cors/policies 目录、Blob/FormData/ReadableStream 等未实现 API、Request cache/integrity/keepalive/priority 等未实现字段、beast 严格解析拒绝的重复 content-length/控制字符头值（header-value-combining）
-- **未实现**：Request/Response 的 body 流（ReadableStream）、Blob/FormData、CORS 与跨域、credentials/cookie、cache/integrity/keepalive、URLSearchParams 双向联动、searchParams 迭代器为数组快照
+- **裸 `%`**：query 中 WHATWG 保留裸 `%`，boost 严格语法无法表示（1 个 expected）
+- **`blob()`**：Request/Response 的 blob() 未实现（4 个 expected；body 消费仅 text/json/arrayBuffer/formData）
+- 清单级 skip：`.sub` 模板、`.https`、worker、credentials/cors/policies 目录、ReadableStream/MediaSource 等未实现 API、Request cache/keepalive/priority 等未实现字段、beast 严格解析拒绝的重复 content-length/控制字符头值（header-value-combining）
+- **未实现**：Request/Response 的 body 流（ReadableStream）、blob()、CORS 与跨域、credentials/cookie、cache/keepalive、URL 静态 parse

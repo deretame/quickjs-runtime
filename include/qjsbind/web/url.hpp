@@ -4,7 +4,7 @@
 //   - URL：绝对/相对（base resolve）解析、各属性读写；origin 用 encoded_origin；
 //   - URLSearchParams：构造（string/record/序列 of pairs/另一实例）、增删查改、sort；
 //   - entries/keys/values 返回数组（非规范迭代器对象），Symbol.iterator 指向 entries；
-//   - searchParams 与 URL.search 的实时联动未实现（getter 每次重新解析，不回写）。
+//   - searchParams 与 URL.search 双向实时联动（SameObject 缓存 + 回写）。
 #pragma once
 
 #include <qjsbind/class.hpp>
@@ -76,6 +76,14 @@ inline std::string form_encode(const std::vector<std::pair<std::string, std::str
 }
 
 // ---------- URLSearchParams ----------
+
+// 联动通过 JS 隐藏属性（URL 对象上 "\x01sp"、searchParams 对象上 "\x01url"）双向引用：
+// - JS 属性对 GC 可见 → 不可达环可被周期回收（RtValue 在 opaque 内不可见，会造成泄漏断言）；
+// - 拷贝语义天然正确（JS 属性不随 C++ 拷贝复制）。
+constexpr const char* kSpOwnerKey = "\x01url"; // searchParams → URL
+constexpr const char* kUrlSpKey = "\x01sp";    // URL → searchParams（SameObject 缓存）
+
+struct UrlImpl; // 前向声明（回写用）
 
 struct UrlSearchParamsImpl {
     std::vector<std::pair<std::string, std::string>> list; // 解码后的键值（插入序）
@@ -170,6 +178,9 @@ inline bool is_url_search_params_instance(JSContext* ctx, JSValueConst v) {
 // JS init 参数 → 键值对列表（前向声明，供 qjs_init；定义见后）
 inline UrlSearchParamsImpl url_search_params_from(JSContext* ctx, JSValueConst init);
 
+// params 修改 → owner URL.search 回写（定义见 UrlImpl 之后）
+inline void notify_change(JSContext* ctx, JSValueConst sp_js, const UrlSearchParamsImpl& p);
+
 // qjs_init 类外定义（依赖 url_search_params_from）
 inline void UrlSearchParamsImpl::qjs_init(JSContext* ctx, qjs::Opt<qjs::Value> init) {
     if (init)
@@ -249,8 +260,18 @@ inline qjs::Value pairs_to_js_array(JSContext* ctx,
 inline void install_url_search_params(qjs::Context& ctx) {
     auto cls = qjs::class_<UrlSearchParamsImpl>(ctx, "URLSearchParams")
                    .constructor<qjs::Opt<qjs::Value>>()
-                   .method("append", &UrlSearchParamsImpl::append)
-                   .method("delete", &UrlSearchParamsImpl::erase)
+                   .method("append",
+                           [](qjs::Ctx ctx, qjs::This<UrlSearchParamsImpl> self,
+                              const std::string& n, const std::string& v) {
+                               self->append(n, v);
+                               notify_change(ctx.ctx, self.js, *self); // 联动回写 owner URL
+                           })
+                   .method("delete",
+                           [](qjs::Ctx ctx, qjs::This<UrlSearchParamsImpl> self,
+                              const std::string& n) {
+                               self->erase(n);
+                               notify_change(ctx.ctx, self.js, *self);
+                           })
                    .method("has", &UrlSearchParamsImpl::has)
                    .method("get", [](qjs::Ctx ctx, qjs::This<UrlSearchParamsImpl> self,
                                      const std::string& name) -> qjs::Value {
@@ -259,8 +280,17 @@ inline void install_url_search_params(qjs::Context& ctx) {
                                 : qjs::Value(ctx.ctx, JS_NULL);
                    })
                    .method("getAll", &UrlSearchParamsImpl::get_all)
-                   .method("set", &UrlSearchParamsImpl::set)
-                   .method("sort", &UrlSearchParamsImpl::sort)
+                   .method("set",
+                           [](qjs::Ctx ctx, qjs::This<UrlSearchParamsImpl> self,
+                              const std::string& n, const std::string& v) {
+                               self->set(n, v);
+                               notify_change(ctx.ctx, self.js, *self);
+                           })
+                   .method("sort",
+                           [](qjs::Ctx ctx, qjs::This<UrlSearchParamsImpl> self) {
+                               self->sort();
+                               notify_change(ctx.ctx, self.js, *self);
+                           })
                    .method("toString", &UrlSearchParamsImpl::to_query)
                    .method("entries",
                            [](qjs::Ctx ctx, qjs::This<UrlSearchParamsImpl> self) -> qjs::Value {
@@ -306,6 +336,16 @@ inline void install_url_search_params(qjs::Context& ctx) {
 
 struct UrlImpl {
     boost::urls::url u; // 绝对 URL
+
+    // 拷贝/赋值：JS 隐藏属性不复制（new URL(u) 是新实例，searchParams 各自创建）
+    UrlImpl() = default;
+    UrlImpl(const UrlImpl& o) : u(o.u) {}
+    UrlImpl& operator=(const UrlImpl& o) {
+        u = o.u;
+        return *this;
+    }
+    UrlImpl(UrlImpl&&) noexcept = default;
+    UrlImpl& operator=(UrlImpl&&) noexcept = default;
 
     void qjs_init(JSContext* ctx, qjs::Opt<qjs::Value> url, qjs::Opt<qjs::Value> base) {
         // 字符串取 UTF-16 单元转 UTF-8：孤立代理 → U+FFFD（WHATWG URL 行为；
@@ -423,8 +463,29 @@ struct UrlImpl {
     std::string origin() const { return std::string(u.encoded_origin()); }
     std::string to_string() const { return href(); }
 
+    // params → URL 回写（不触发反向同步，params 是数据源）
+    void set_search_raw(const std::string& q) {
+        if (q.empty())
+            u.remove_query();
+        else
+            u.set_encoded_query(q);
+    }
+
+    // URL.search 变化后同步缓存的 searchParams 对象（live 语义；self_js = URL 的 JS 值）
+    void sync_search_params(JSContext* ctx, JSValueConst self_js) {
+        JSValue sp = JS_GetPropertyStr(ctx, self_js, kUrlSpKey);
+        if (!JS_IsUndefined(sp)) {
+            if (auto* p = qjs::registry_of(ctx).opaque<UrlSearchParamsImpl>(ctx, sp))
+                p->list = UrlSearchParamsImpl::from_query(search()).list;
+            JS_FreeValue(ctx, sp);
+        }
+    }
+
     // ---- setters（WHATWG 语义子集）----
-    void set_href(JSContext* ctx, const std::string& v) { u = parse(ctx, v, "").u; }
+    void set_href(JSContext* ctx, const std::string& v, JSValueConst self_js) {
+        u = parse(ctx, v, "").u;
+        sync_search_params(ctx, self_js);
+    }
     void set_protocol(const std::string& v) {
         std::string s = v;
         if (!s.empty() && s.back() == ':')
@@ -449,7 +510,7 @@ struct UrlImpl {
             u.set_port(v);
     }
     void set_pathname(const std::string& v) { u.set_encoded_path(v); }
-    void set_search(const std::string& v) {
+    void set_search(JSContext* ctx, const std::string& v, JSValueConst self_js) {
         std::string s = v;
         if (!s.empty() && s.front() == '?')
             s.erase(0, 1);
@@ -457,6 +518,7 @@ struct UrlImpl {
             u.remove_query();
         else
             u.set_encoded_query(s);
+        sync_search_params(ctx, self_js); // live：缓存的 searchParams 同步新值
     }
     void set_hash(const std::string& v) {
         std::string s = v;
@@ -469,13 +531,23 @@ struct UrlImpl {
     }
 };
 
+// params 修改 → owner URL.search 回写（sp_js = searchParams 的 JS 值）
+inline void notify_change(JSContext* ctx, JSValueConst sp_js, const UrlSearchParamsImpl& p) {
+    JSValue owner = JS_GetPropertyStr(ctx, sp_js, kSpOwnerKey);
+    if (!JS_IsUndefined(owner)) {
+        if (auto* url = qjs::registry_of(ctx).opaque<UrlImpl>(ctx, owner))
+            url->set_search_raw(p.to_query());
+        JS_FreeValue(ctx, owner);
+    }
+}
+
 inline void install_url(qjs::Context& ctx) {
     install_url_search_params(ctx);
     auto cls = qjs::class_<UrlImpl>(ctx, "URL")
                    .constructor<qjs::Opt<qjs::Value>, qjs::Opt<qjs::Value>>()
                    .getter("href", [](qjs::This<UrlImpl> self) { return self->href(); })
                    .setter("href", [](qjs::Ctx ctx, qjs::This<UrlImpl> self, const std::string& v) {
-                       self->set_href(ctx.ctx, v); // 解析失败 → TypeError
+                       self->set_href(ctx.ctx, v, self.js); // 解析失败 → TypeError
                    })
                    .getter("protocol", [](qjs::This<UrlImpl> self) { return self->protocol(); })
                    .setter("protocol", [](qjs::This<UrlImpl> self, const std::string& v) {
@@ -498,8 +570,8 @@ inline void install_url(qjs::Context& ctx) {
                        self->set_pathname(v);
                    })
                    .getter("search", [](qjs::This<UrlImpl> self) { return self->search(); })
-                   .setter("search", [](qjs::This<UrlImpl> self, const std::string& v) {
-                       self->set_search(v);
+                   .setter("search", [](qjs::Ctx ctx, qjs::This<UrlImpl> self, const std::string& v) {
+                       self->set_search(ctx.ctx, v, self.js);
                    })
                    .getter("hash", [](qjs::This<UrlImpl> self) { return self->hash(); })
                    .setter("hash", [](qjs::This<UrlImpl> self, const std::string& v) {
@@ -508,11 +580,20 @@ inline void install_url(qjs::Context& ctx) {
                    .getter("origin", [](qjs::This<UrlImpl> self) { return self->origin(); })
                    .getter("searchParams",
                            [](qjs::Ctx ctx, qjs::This<UrlImpl> self) -> qjs::Value {
-                               // v1：从当前 search 重新解析，不回写
-                               UrlSearchParamsImpl p =
-                                   UrlSearchParamsImpl::from_query(self->search());
-                               return qjs::Value(
-                                   ctx.ctx, qjs::js_convert<UrlSearchParamsImpl>::to_js(ctx.ctx, p));
+                               // SameObject + 双向联动：URL 上挂隐藏属性缓存 searchParams；
+                               // searchParams 上挂 owner 隐藏属性（JS 属性 GC 可见，环可回收）
+                               JSValue sp = JS_GetPropertyStr(ctx.ctx, self.js, kUrlSpKey);
+                               if (JS_IsUndefined(sp)) {
+                                   UrlSearchParamsImpl p =
+                                       UrlSearchParamsImpl::from_query(self->search());
+                                   sp = qjs::js_convert<UrlSearchParamsImpl>::to_js(ctx.ctx, p);
+                                   // SetPropertyStr 转移所有权：dup 后挂
+                                   JS_SetPropertyStr(ctx.ctx, sp, kSpOwnerKey,
+                                                     JS_DupValue(ctx.ctx, self.js));
+                                   JS_SetPropertyStr(ctx.ctx, self.js, kUrlSpKey,
+                                                     JS_DupValue(ctx.ctx, sp));
+                               }
+                               return qjs::Value(ctx.ctx, sp); // 转移所有权（新引用）
                            })
                    .method("toString", [](qjs::This<UrlImpl> self) { return self->to_string(); })
                    .method("toJSON", [](qjs::This<UrlImpl> self) { return self->to_string(); });

@@ -596,7 +596,19 @@ inline void install_url(qjs::Context& ctx) {
                                return qjs::Value(ctx.ctx, sp); // 转移所有权（新引用）
                            })
                    .method("toString", [](qjs::This<UrlImpl> self) { return self->to_string(); })
-                   .method("toJSON", [](qjs::This<UrlImpl> self) { return self->to_string(); });
+                   .method("toJSON", [](qjs::This<UrlImpl> self) { return self->to_string(); })
+                   .static_method("parse", [](qjs::Ctx ctx, const std::string& url,
+                                              qjs::Opt<qjs::Value> base) -> qjs::Value {
+                       // 规范：URL.parse(url, base)——解析失败返回 null（不抛）
+                       try {
+                           UrlImpl u =
+                               UrlImpl::parse(ctx.ctx, url, base ? base->as<std::string>() : "");
+                           return qjs::Value(ctx.ctx,
+                                            qjs::js_convert<UrlImpl>::to_js(ctx.ctx, u));
+                       } catch (const qjs::js_error&) {
+                           return qjs::Value(ctx.ctx, JS_NULL);
+                       }
+                   });
 
     // v1 不做 Symbol.iterator 补丁（entries/keys/values 返回数组已满足 fetch 场景；
     // 注意：不可用 ctx.eval 做原型补丁——异常会污染 current_exception）

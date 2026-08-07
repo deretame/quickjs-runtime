@@ -68,10 +68,8 @@ JS_API_SKIP = [
     (r"\bdocument\.", "DOM document 未实现"),
     (r"\bwindow\.open\b", "window.open 未实现"),
     (r"\bgetReader\s*\(", "body 流（getReader）未实现"),
-    (r"\.blob\s*\(", "response/request.blob() 未实现"),
     (r"\bMediaSource\b", "MediaSource 未实现"),
     # RequestInit 未实现字段
-    (r"['\"]integrity['\"]\s*:", "integrity 未实现"),
     (r"['\"]keepalive['\"]\s*:", "keepalive 未实现"),
     (r"['\"]cache['\"]\s*:", "Request cache 模式未实现"),
     (r"['\"]credentials['\"]\s*:", "credentials 未实现"),

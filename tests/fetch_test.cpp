@@ -13,6 +13,9 @@
 #include <net/http_backend.hpp>
 #include "wpt_server.hpp"
 
+#include <boost/asio/steady_timer.hpp>
+
+#include <chrono>
 #include <fstream>
 #include <sstream>
 
@@ -506,6 +509,89 @@ TEST_F(FetchFixture, FormDataRoundTrip)
     ASSERT_FALSE(r.is_exception());
     rt.run_to_completion();
     EXPECT_EQ(ctx.eval("__m").as<std::string>(), "true|application/json");
+}
+
+// ---- P0 补齐：blob() / Response.json() / URL.parse() / AbortSignal.timeout/any ----
+TEST_F(FetchFixture, P0BlobAndJson)
+{
+    // Request.blob() / Response.blob()：返回 Blob（bodyUsed 置位）
+    Value r = ctx.eval(
+        "var p = new Response('hello').blob().then(b => {"
+        "  globalThis.__blob = b.size + '|' + b.type;"
+        "  return b.text();"
+        "}); 'ok'");
+    ASSERT_FALSE(r.is_exception());
+    rt.run_to_completion();
+    EXPECT_EQ(ctx.eval("__blob").as<std::string>(), "5|text/plain;charset=utf-8");
+    // Response.json(data, init)：默认 application/json；init.headers 优先
+    r = ctx.eval(
+        "var a = new Response(JSON.stringify({k: 1}));"
+        "var b = Response.json({k: 1});"
+        "var c = Response.json({k: 1}, {status: 201, headers: {'content-type': 'application/problem+json'}});"
+        "a.headers.get('content-type') + '|' + b.headers.get('content-type') + '|' + c.status + '|' +"
+        "c.headers.get('content-type');");
+    ASSERT_FALSE(r.is_exception());
+    EXPECT_EQ(r.as<std::string>(),
+              "text/plain;charset=UTF-8|application/json|201|application/problem+json");
+    // Response.json body 内容 = JSON.stringify 结果
+    r = ctx.eval(
+        "Response.json({a: [1, 2]}).text().then(t => { globalThis.__jt = t; }); 'ok'");
+    ASSERT_FALSE(r.is_exception());
+    rt.run_to_completion();
+    EXPECT_EQ(ctx.eval("__jt").as<std::string>(), "{\"a\":[1,2]}");
+}
+
+TEST_F(FetchFixture, P0UrlParse)
+{
+    Value r = ctx.eval(
+        "String(URL.parse('http://x/y?z=1')) + '|' +"
+        "String(URL.parse('/rel', 'http://base/')) + '|' +"
+        "String(URL.parse('not a url')) + '|' +"
+        "String(URL.parse('http://[bad')) + '|' +"
+        "(URL.parse('http://x/') === null ? 'null' : 'ok');");
+    ASSERT_FALSE(r.is_exception());
+    // 合法 → 对象（String 转 href）；非法 → null（不抛）
+    EXPECT_EQ(r.as<std::string>(), "http://x/y?z=1|http://base/rel|null|null|ok");
+}
+
+TEST_F(FetchFixture, P0AbortSignalTimeoutAny)
+{
+    // AbortSignal.timeout：到期后 aborted=true，reason=TimeoutError。
+    // 定时器挂 io_ 注册表（不走 pending_，Node 语义：独立 timeout 不保持
+    // run_to_completion），用 io.run_for 显式驱动触发。
+    Value r = ctx.eval(
+        "var sig = AbortSignal.timeout(20);"
+        "globalThis.__timeout = 'pending';"
+        "sig.addEventListener('abort', () => {"
+        "  globalThis.__timeout = sig.aborted + '|' + sig.reason.name + '|' + sig.reason.message;"
+        "}); 'ok'");
+    ASSERT_FALSE(r.is_exception());
+    {
+        auto& io = rt.io();
+        boost::asio::steady_timer kick(io, std::chrono::milliseconds(60));
+        kick.async_wait([](const boost::system::error_code&) {});
+        io.run_for(std::chrono::milliseconds(60));
+    }
+    EXPECT_EQ(ctx.eval("__timeout").as<std::string>(),
+              "true|TimeoutError|signal timed out");
+    // 未到期前 aborted=false
+    r = ctx.eval("var s2 = AbortSignal.timeout(100000); s2.aborted;");
+    ASSERT_FALSE(r.is_exception());
+    EXPECT_EQ(r.as<std::string>(), "false");
+    // AbortSignal.any：任一 abort → 输出 abort（事件同步传播）；已 abort 输入 → 立即 abort
+    r = ctx.eval(
+        "var a = new AbortController(); var b = new AbortController();"
+        "var any = AbortSignal.any([a.signal, b.signal]);"
+        "globalThis.__any = 'pending';"
+        "any.addEventListener('abort', () => { globalThis.__any = any.aborted + '|' + any.reason.name; });"
+        "a.abort(); 'ok'");
+    ASSERT_FALSE(r.is_exception());
+    EXPECT_EQ(ctx.eval("__any").as<std::string>(), "true|AbortError");
+    r = ctx.eval(
+        "var c = new AbortController(); c.abort();"
+        "AbortSignal.any([c.signal]).aborted;");
+    ASSERT_FALSE(r.is_exception());
+    EXPECT_EQ(r.as<std::string>(), "true");
 }
 
 } // namespace

@@ -124,6 +124,16 @@ inline qjs::Value consume_array_buffer(JSContext* ctx, const std::string& bytes)
     return qjs::Value(ctx, JS_NewArrayBufferCopy(
                               ctx, reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size()));
 }
+// 规范：blob() 返回的 Blob.type = 响应 Content-Type（小写；保留参数——
+// 浏览器实测含 boundary，`new Response(blob).formData()` 依赖它）
+inline qjs::Value consume_blob(JSContext* ctx, const std::string& bytes, const std::string& type) {
+    BlobImpl b;
+    b.bytes = bytes;
+    b.type = type;
+    std::transform(b.type.begin(), b.type.end(), b.type.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return qjs::Value(ctx, qjs::js_convert<BlobImpl>::to_js(ctx, b));
+}
 
 // 消费入口（置 bodyUsed；重复消费 → TypeError）
 template <class Self, class Fn>
@@ -132,6 +142,22 @@ qjs::Value consume_impl(JSContext* ctx, Self& self, const char* what, Fn&& fn) {
         throw_type_error(ctx, "%s: body 已被消费", what);
     self.body_used = true;
     return fn(ctx, self.body_bytes);
+}
+
+// 读取当前 content-type：优先从 headers JS 对象（用户 set/delete 后同步）；
+// 未访问过 headers 时退回内部 list（headers getter 是独立拷贝，见 install 注释）
+template <class T>
+std::string content_type_of(JSContext* ctx, const T& self) {
+    if (!self.headers_js.empty()) {
+        auto* h = qjs::registry_of(ctx).opaque<HeadersImpl>(ctx, self.headers_js.raw());
+        if (h) {
+            auto v = h->get(ctx, "content-type");
+            if (v)
+                return *v;
+            return "";
+        }
+    }
+    return self.headers.get(ctx, "content-type").value_or("");
 }
 
 // 解析 URL 的端口并做 blocked 检查（定义见 RequestImpl 之后；类内方法先声明）
@@ -443,7 +469,7 @@ inline void install_request(qjs::Context& ctx) {
                    .method("formData",
                            [](qjs::Ctx ctx, qjs::This<RequestImpl> self) -> exec::task<qjs::Value> {
                                const std::string ct =
-                                   self->headers.get(ctx.ctx, "content-type").value_or("");
+                                   content_type_of(ctx.ctx, *self);
                                co_return consume_impl(
                                    ctx.ctx, *self, "Request",
                                    [ct](JSContext* ctx, const std::string& bytes) -> qjs::Value {
@@ -453,7 +479,17 @@ inline void install_request(qjs::Context& ctx) {
                                        return qjs::Value(
                                            ctx, qjs::js_convert<FormDataImpl>::to_js(ctx, *fd));
                                    });
+                           })
+                   .method("blob", [](qjs::Ctx ctx, qjs::This<RequestImpl> self)
+                               -> exec::task<qjs::Value> {
+                       const std::string ct =
+                           content_type_of(ctx.ctx, *self);
+                       co_return consume_impl(
+                           ctx.ctx, *self, "Request",
+                           [ct](JSContext* c, const std::string& bytes) {
+                               return consume_blob(c, bytes, ct);
                            });
+                   });
     ctx.globals().set("Request", cls.constructor_function());
 }
 
@@ -624,7 +660,7 @@ inline void install_response(qjs::Context& ctx) {
                    .method("formData",
                            [](qjs::Ctx ctx, qjs::This<ResponseImpl> self) -> exec::task<qjs::Value> {
                                const std::string ct =
-                                   self->headers.get(ctx.ctx, "content-type").value_or("");
+                                   content_type_of(ctx.ctx, *self);
                                co_return consume_impl(
                                    ctx.ctx, *self, "Response",
                                    [ct](JSContext* ctx, const std::string& bytes) -> qjs::Value {
@@ -635,6 +671,16 @@ inline void install_response(qjs::Context& ctx) {
                                            ctx, qjs::js_convert<FormDataImpl>::to_js(ctx, *fd));
                                    });
                            })
+                   .method("blob", [](qjs::Ctx ctx, qjs::This<ResponseImpl> self)
+                               -> exec::task<qjs::Value> {
+                       const std::string ct =
+                           content_type_of(ctx.ctx, *self);
+                       co_return consume_impl(
+                           ctx.ctx, *self, "Response",
+                           [ct](JSContext* c, const std::string& bytes) {
+                               return consume_blob(c, bytes, ct);
+                           });
+                   })
                    .static_method("error", [](qjs::Ctx ctx) -> qjs::Value {
                        ResponseImpl r;
                        r.status = 0;
@@ -652,6 +698,41 @@ inline void install_response(qjs::Context& ctx) {
                        r.type = "default";
                        r.headers.append_raw("location", RequestImpl::resolve_url(ctx.ctx, url));
                        return qjs::Value(ctx.ctx, qjs::js_convert<ResponseImpl>::to_js(ctx.ctx, r));
+                   })
+                   .static_method("json", [](qjs::Ctx ctx, qjs::Value data,
+                                             qjs::Opt<qjs::Value> init) -> qjs::Value {
+                       // 规范：bytes = JSON serialize(data)（BigInt/循环引用 → TypeError）
+                       JSValue s = JS_JSONStringify(ctx.ctx, data.raw(), JS_UNDEFINED, JS_UNDEFINED);
+                       if (JS_IsException(s))
+                           throw qjs::js_error(ctx.ctx, JS_GetException(ctx.ctx));
+                       std::string json;
+                       {
+                           size_t len = 0;
+                           const char* str = JS_ToCStringLen(ctx.ctx, &len, s);
+                           json.assign(str, len);
+                           JS_FreeCString(ctx.ctx, str);
+                       }
+                       JS_FreeValue(ctx.ctx, s);
+                       // 规范：仅当 init.headers 未显式给 content-type 时补 application/json
+                       //（string body 的默认 text/plain 需被替换）
+                       bool user_ct = false;
+                       if (init && init->is_object()) {
+                           qjs::Object obj(*init);
+                           qjs::Value hdrs = obj.get("headers");
+                           if (!hdrs.is_undefined() && !hdrs.is_null()) {
+                               HeadersImpl h = headers_from(ctx.ctx, hdrs.raw());
+                               user_ct = h.has(ctx.ctx, "content-type");
+                           }
+                       }
+                       qjs::Opt<qjs::Value> body;
+                       body.value.emplace(ctx.ctx,
+                                          JS_NewStringLen(ctx.ctx, json.data(), json.size()));
+                       ResponseImpl r;
+                       r.qjs_init(ctx.ctx, body, init);
+                       if (!user_ct)
+                           r.headers.set(ctx.ctx, "content-type", "application/json");
+                       return qjs::Value(ctx.ctx,
+                                        qjs::js_convert<ResponseImpl>::to_js(ctx.ctx, r));
                    });
     ctx.globals().set("Response", cls.constructor_function());
     // forEach 的 container 参数包装（headers 实例；活迭代器补丁见 install_headers）

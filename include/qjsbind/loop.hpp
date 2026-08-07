@@ -14,6 +14,7 @@
 
 #include <qjsbind/context.hpp>
 #include <qjsbind/error.hpp>
+#include <qjsbind/web/timers.hpp> // shutdown 清理挂起定时器注册表
 
 namespace qjs {
 
@@ -106,6 +107,17 @@ inline void Runtime::shutdown()
             io_.run_one(); // guard_ 仍在：取消结算必然 post 回 io_
         }
         pump_js_jobs(); // 3. 收尾 job（AbortError 的 then/catch 链）
+    }
+    // 挂起定时器（setTimeout/AbortSignal.timeout）：Node 语义不保持进程，
+    // 随本轮结束丢弃。逐个 cancel（async_wait handler 同步以 operation_aborted
+    // 结束，释放 entry 的 RtValue 引用），再清表（map.clear() 本身不 cancel）。
+    {
+        auto& tm = qjsbind::web::timers_detail::timer_map();
+        for (const auto& [id, e] : tm)
+            e->timer->cancel();
+        tm.clear();
+        while (io_.poll_one() > 0) {
+        } // 消化可能延迟的 cancel handler（asio 允许延迟调用）
     }
     guard_.reset(); // 4. 解除保活
 

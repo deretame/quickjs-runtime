@@ -165,9 +165,9 @@ public:
     }
     ~Runtime()
     {
-        // 兜底关闭：取消在飞任务并驱动到空（协作式；正常流程经 stop() → run() 已 shutdown）
-        if (pending_.load(std::memory_order_acquire) != 0)
-            shutdown();
+        // 兜底关闭（幂等）：取消在飞任务并驱动到空、清理挂起定时器
+        // （pending_==0 时也执行清理；正常流程经 stop() → run() 已 shutdown）
+        shutdown();
         // 显式 GC：opaque 的 finalizer 在 ctx 存活期执行（opaque 内的
         // RtValue/JSValue 成员可安全释放；否则惰性 GC 会让它们泄漏到
         // JS_FreeRuntime 的 debug assert）。仍可达对象在 FreeContext 后

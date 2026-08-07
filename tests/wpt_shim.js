@@ -15,9 +15,6 @@
     'Create headers with existing headers with custom iterator',
     // boost 严格 URL 语法：裸 % 被编码为 %25（安全特性，见 fetch_design.md）
     'Escaping produces double-percent',
-    // response/request.blob() 未实现（v1 边界；body 消费方法仅 text/json/arrayBuffer/formData）
-    'Calling blob()',
-    'Aborting a request after calling blob()',
     // 参照 Node(undici) 而非浏览器：referer/cookie/origin 等 forbidden 头用户
     // 自定义后正常发送（wpt 按浏览器语义期望不发送，登记为有意偏离）
     ' is a forbidden request header'

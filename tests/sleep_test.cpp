@@ -1,4 +1,5 @@
 #include <dart_cpp_bridge/sleep.hpp>
+#include <qjsbind/std_exec.hpp>
 
 #include <boost/asio/executor_work_guard.hpp>
 #include <exec/windows/windows_thread_pool.hpp>
@@ -150,17 +151,17 @@ TEST(Sleep, CancelAsioBackendBeforeCompletion)
 
 // ---------------------------------------------------------------------------
 // 协程销毁发生在回调线程自身（真正触发 completing_thread 分支的形态）：
-// 用 stdexec::task（标准 P2300 协程，co_await sender 走 as_awaitable 直接
+// 用 std_exec::task（标准 P2300 协程，co_await sender 走 as_awaitable 直接
 // 同步 resume，不经过 continues_on/run_loop）——完成后台线程 set_value 在
 // 完成线程原地恢复协程，co_return 时帧销毁连带 opstate 析构，析构线程 ==
 // 回调线程。abandon 必须走 completing_thread 检测路径（不等待），否则死锁。
-// 注：exec::task + sync_wait 下完成会 post 回 sync_wait 线程恢复协程，不会
-// 走到该分支（修复前后都通过），故此处必须用 stdexec::task。
+// 注：std_exec::task + sync_wait 下完成会 post 回 sync_wait 线程恢复协程，不会
+// 走到该分支（修复前后都通过），故此处必须用 std_exec::task。
 // ---------------------------------------------------------------------------
 
 TEST(Sleep, CoroutineDestroysOpOnCallbackThread)
 {
-  auto task = []() -> stdexec::task<int> {
+  auto task = []() -> std_exec::task<int> {
     co_await dcb::thread_sleep(5ms);
     co_return 42;
   }();
@@ -174,7 +175,7 @@ TEST(Sleep, CoroutineDestroysOpOnAsioCallbackThread)
   boost::asio::io_context io;
   io_thread_guard guard(io);
 
-  auto task = [&io]() -> stdexec::task<int> {
+  auto task = [&io]() -> std_exec::task<int> {
     co_await dcb::asio_sleep(io, 5ms);
     co_return 42;
   }();

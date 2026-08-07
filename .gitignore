@@ -16,6 +16,9 @@ __pycache__/
 # vcpkg（由 scripts/bootstrap_vcpkg.py 克隆，不纳入版本管理）
 third_party/vcpkg/
 
+# cheerio 官方源码（测试资产来源，转译产物 tests/cheerio/ 已纳入版本管理）
+third_party/cheerio/
+
 # IDE
 .vs/
 .vscode/

@@ -13,7 +13,7 @@
 ### 目标
 
 1. **同步函数自动绑定**：普通 C++ 函数（自由函数/函数指针/lambda/成员函数）一行注册进 JS，**签名里不出现任何 QuickJS 类型**（无 `JSContext*`、无 `JSValue`）。
-2. **异步函数自动绑定**：返回 `stdexec::task<T>` / `exec::task<T>` / 任意 sender 的函数，注册后在 JS 侧表现为返回 Promise 的函数。
+2. **异步函数自动绑定**：返回 `stdexec::task<T>`（即标准 `std::exec::task`，下同）/ 任意 sender 的函数，注册后在 JS 侧表现为返回 Promise 的函数。
 3. **类自动绑定**：C++ 类型注册为 JS class（构造器、方法、静态方法、字段、getter/setter）。方法可以用成员函数指针，也可以用「第一个参数是 `This<T>` 的自由函数」这一语法糖。
 4. **异步底座**：stdexec（sender/receiver），IO 运行时为 asio（`exec::asio` 适配器），事件循环与 QuickJS 同线程。
 5. **多运行时并行**：进程内 N 个 `Runtime` 各自绑定一根 JS 线程并行运行（隔离/沙箱/并行宿主），跨 Runtime 只经 channel 交换原生数据，不共享 JS 状态（§1）。
@@ -108,7 +108,7 @@ class Runtime {                    // 拥有 JSRuntime + 主 JSContext + 事件�
   JSRuntime* rt_;
   JSContext* ctx_;
   asio::io_context io_;            // 见 §5/§8（成员声明顺序保证销毁次序）
-  exec::async_scope scope_;
+  stdexec::counting_scope scope_;
   // ...
 public:
   explicit Runtime(std::string id = {});     // 空 id → 自动 UUID v4
@@ -124,7 +124,7 @@ public:
 - quickjs-ng 里 `JS_FreeValue` / `JS_DupValue` / `JS_FreeCString` 是真正的导出函数（:864-869, :921），直接调。
 - `JS_ToCStringLen` 在 ng 是 `JS_ToCStringLen2(ctx, plen, val, /*cesu8=*/bool)` 的 inline 包装（:901-909）；返回指针**必须配对 `JS_FreeCString`**（quickjs.c:4983-4989），且指向 runtime 内部缓冲，不得跨调用持有 → 转换层一律立即拷成 `std::string`。
 - **实例 id**：`Runtime(std::string id = {})`——传自定义 id（如 `"worker-1"`），留空则自动生成 UUID v4（`boost::uuids::random_generator`，vcpkg 依赖 `boost-uuid`）。`id()` 只读访问。用途：多 Runtime 日志区分、跨 Runtime channel 消息的来源标识（§8.2）、亲和断言错误信息。进程内唯一性：自定义时是调用方责任；自动生成时碰撞概率可忽略（v4 有 122 bit 随机空间）。
-- **不可移动性**：`Runtime` 是不可移动/复制的集合体（`asio::io_context`、`exec::async_scope`（内部含 mutex）均不可移动）——多 Runtime 场景下用 `std::unique_ptr<Runtime>` 或直接栈上分配持有，不需要 move 语义（§8.2）。
+- **不可移动性**：`Runtime` 是不可移动/复制的集合体（`asio::io_context`、`stdexec::counting_scope`（内部含 mutex）均不可移动）——多 Runtime 场景下用 `std::unique_ptr<Runtime>` 或直接栈上分配持有，不需要 move 语义（§8.2）。
 
 ## 3. 类型转换系统 `js_convert<T>`
 
@@ -159,7 +159,7 @@ struct js_convert;                 // 主模板未定义 = 该类型不可转换
 | `void`（返回） | `undefined` | |
 | `qjs::Value` / `Object` / `Array` / `Function` | 原样 | 逃生舱：签名里**允许**出现这些 qjsbind 自有类型（不是裸 qjs 类型） |
 | 已注册的 bound class `T` | 类实例 | 见 §6 |
-| 返回 `stdexec::task<T>` / sender | Promise | 见 §5 |
+| 返回 `stdexec::task<T>`（`std::exec::task`）/ sender | Promise | 见 §5 |
 
 显式不做自动转换的：`char*` 出参、裸 `T*` 返回（所有权不明，编译期拒绝并提示用 `std::shared_ptr` 或按值返回）。
 
@@ -297,17 +297,17 @@ globals.set("add", add);
 ```cpp
 template <class R>
 inline constexpr bool is_async_result_v = stdexec::sender<R>;
-// stdexec::task<T> 与 exec::task<T> 都满足 sender concept
-// （stdexec/__detail/__task.hpp、exec/task.hpp:737-739 的 enable_sender）
+// stdexec::task<T>（即 std::exec::task）与普通 sender 都满足 sender concept
+// （stdexec/__detail/__task.hpp 的 enable_sender）
 ```
 
 thunk 里 `if constexpr (is_async_result_v<R>)` 走 promise 包装分支（见 4.3 骨架）。
 
-**注册路径对 task 和普通 sender 一视同仁**：`qjs::func` 只看返回类型是否满足 `stdexec::sender` 概念——`exec::task<T>`、`stdexec::task<T>`、`asio_op | then(...)` 这类运行期拼出来的管线 sender，全都自动包装成 Promise，不需要任何额外标注。`promise_from_sender` 是自动路径内部调用的原语，用户只在「手里已经握着一个 sender **对象**（而不是一个函数），想手动换成 Promise」时才直接用它，典型如绑定函数体内动态拼管线：
+**注册路径对 task 和普通 sender 一视同仁**：`qjs::func` 只看返回类型是否满足 `stdexec::sender` 概念——`stdexec::task<T>`（`std::exec::task`）、`asio_op | then(...)` 这类运行期拼出来的管线 sender，全都自动包装成 Promise，不需要任何额外标注。`promise_from_sender` 是自动路径内部调用的原语，用户只在「手里已经握着一个 sender **对象**（而不是一个函数），想手动换成 Promise」时才直接用它，典型如绑定函数体内动态拼管线：
 
 ```cpp
 // 自动路径：函数返回 task 或 sender，qjs::func 直接注册
-globals.set("fetch", qjs::func(fetch));        // exec::task<string> fetch(string)
+globals.set("fetch", qjs::func(fetch));        // stdexec::task<string> fetch(string)
 globals.set("query", qjs::func(query));        // auto query(string) { return db_get(q) | then(parse); }
 
 // 手动路径：sender 对象 → Promise
@@ -360,9 +360,9 @@ JSValue promise_from_sender(JSContext* ctx, S&& sndr) {
 
 关键点：
 
-- **错误通道必须先消化再 spawn**：链尾 `then/upon_error/upon_stopped` 三路全覆盖后 sender 不再 `set_error`/`set_stopped`。`stdexec::spawn` 对会失败的 sender 是编译期拒绝（`__spawn.hpp`），`exec::async_scope::spawn` 不拦但出错直接 `std::terminate()`（`exec/async_scope.hpp:758-762`）——所以三个收尾 lambda 必须 `noexcept` 且内部不再泄漏异常。
+- **错误通道必须先消化再 spawn**：链尾 `then/upon_error/upon_stopped` 三路全覆盖后 sender 不再 `set_error`/`set_stopped`。`stdexec::spawn` 对会失败的 sender 是编译期拒绝（`stdexec/__detail/__spawn.hpp`），`exec::async_scope::spawn` 不拦但出错直接 `std::terminate()`（`exec/async_scope.hpp:758-762`）——所以三个收尾 lambda 必须 `noexcept` 且内部不再泄漏异常。
 - **opstate 生命周期**：由 `async_scope` 接管（spawn = nest + 堆上 opstate + 自删除），不用手写 connect/start 的存活性管理。scope 存在 `Runtime` 里，`Runtime::spawn` 同时维护在飞任务计数 `pending_`（§8.2）；关闭时 `request_stop()` 后**驱动 io_ 直至 `pending_ == 0`**（§8.3）——不能 `sync_wait(scope.on_empty())`，原因见 §8.3 开头。
-- **exec::task 的 start scheduler 要求**：`exec::task` 被启动时要求父环境应答 `get_start_scheduler`，否则 static_assert（用法文档 §6.5、§14）。`scope.spawn(sndr, env)` 的第二参 env 里注入 `get_start_scheduler = js_sched` 即可；协程每次 `co_await` 后自动"回家"到 JS 线程（exec::task 的调度亲和，`exec/task.hpp:613-615`）。
+- **stdexec::task 的 start scheduler 要求**：`stdexec::task` 被启动时要求父环境应答 `get_start_scheduler`，否则 static_assert（用法文档 §6.5、§14）。`stdexec::spawn(sndr, token, env)` 的 env 里注入 `get_start_scheduler = js_sched` 即可；协程每次 `co_await` 后自动"回家"到 JS 线程（stdexec::task 的调度亲和，`stdexec/__detail/__task.hpp`）。
 - `continues_on(env.js_sched)` 中 `js_sched` 是 **io_context_scheduler**——用法文档 §12.6.2 已给出实现：`schedule()` 返回 `asio_impl::post(ioc, exec::asio::use_sender)`。裸 `asio::io_context` 没有现成 stdexec scheduler，这层薄包装是必须写的。
 - promise 结算 = `JS_Call(ctx, resolve, JS_UNDEFINED, 1, &val)`（`quickjs-libc.c:2512-2558` 的 os.sleepAsync 就是此模式）；`JS_Call` 会把 then 回调排进 job 队列，由事件循环的 job 泵执行（§8）。
 - 未处理 rejection 用 `JS_SetHostPromiseRejectionTracker`（:1177）挂监控，照抄 `js_std_promise_rejection_tracker` 的行为（`quickjs-libc.c:4783-4828`）。
@@ -371,11 +371,11 @@ JSValue promise_from_sender(JSContext* ctx, S&& sndr) {
 
 ```cpp
 // ★ 自由函数，不是 lambda —— MSVC 协程 lambda 有参数损坏 bug（见 §10.1）
-exec::task<std::string> fetch_text(std::string url) {
+stdexec::task<std::string> fetch_text(std::string url) {
   asio_impl::steady_timer timer{current_io()};
   co_await timer.async_wait(exec::asio::use_sender);   // asio op → sender（用法文档 §12.6.1）
   // 需要重计算时：co_await exec::reschedule_coroutine_on(pool.get_scheduler());
-  // 回来后继续 co_await，exec::task 会自动回到 home scheduler（JS 线程）
+  // 回来后继续 co_await，stdexec::task 会自动回到 home scheduler（JS 线程）
   co_return co_await do_http(std::move(url));
 }
 
@@ -491,7 +491,7 @@ finalizer 签名 `void (*)(JSRuntime*, JSValueConst)`（:674）——**没有 ct
 
 ### 6.4 方法 / 字段 / getter-setter
 
-- `.method(name, fn)`：`fn` 走与全局函数完全相同的 `func()` 机制（成员函数指针在 traits 里把 `this` 折算为首个特殊参数），产物 `JS_SetPropertyStr(proto, name, fn_obj)`。**异步方法天然支持**：成员函数返回 `exec::task<T>` 时走 §5 的 promise 分支（但注意 §10.1 的 MSVC 协程坑——协程方法建议写成自由函数 + `This<T>`）。
+- `.method(name, fn)`：`fn` 走与全局函数完全相同的 `func()` 机制（成员函数指针在 traits 里把 `this` 折算为首个特殊参数），产物 `JS_SetPropertyStr(proto, name, fn_obj)`。**异步方法天然支持**：成员函数返回 `stdexec::task<T>` 时走 §5 的 promise 分支（但注意 §10.1 的 MSVC 协程坑——协程方法建议写成自由函数 + `This<T>`）。
 - `.static_method(name, fn)`：挂到**构造器函数对象**上（rquickjs 同样处理，`methods.rs:230-265`）。
 - `.field(name, &T::member)`：生成 getter/setter 两个小 closure，`JS_DefinePropertyGetSet(ctx, proto, atom, get, set, JS_PROP_CONFIGURABLE)`（:1057-1059）。也可以显式 `.getter(name, fn)` / `.setter(name, fn)`。
 - 持有 JS 值的类（成员里有 `qjs::Value`/`Persistent`）：提供 `.trace(fn)` 钩子填 `JSClassDef.gc_mark`，漏写会导致 GC 后悬垂——这是 rquickjs 用 derive 宏保证、C++ 只能靠约定的**正确性高风险点**，文档和静态断言都要强调。
@@ -654,22 +654,22 @@ void Runtime::shutdown() {
 
 ```cpp
 // ✗ 禁止：协程 lambda（参数会变成垃圾数字）
-auto bad = [](std::string url) -> exec::task<std::string> { ... };
+auto bad = [](std::string url) -> stdexec::task<std::string> { ... };
 
 // ✓ 正确：自由函数
-exec::task<std::string> fetch_text(std::string url) { ... }
+stdexec::task<std::string> fetch_text(std::string url) { ... }
 
 // ✓ 需要"方法"语义的协程：自由函数 + This<T> 糖
-exec::task<void> point_upload(qjs::This<Point> self, std::string url) { ... }
+stdexec::task<void> point_upload(qjs::This<Point> self, std::string url) { ... }
 ```
 
 这正好与绑定层兼容——自由函数是绑定的一等公民。测试阶段若发现协程参数值异常，先检查是否误用了协程 lambda，不要怀疑绑定层。
 
 ### 10.2 其余坑（按风险排序）
 
-1. **异常不得穿过 QuickJS C 帧**：所有 thunk 出口必须 try/catch 全捕获（§4.3）。FFI 边界外的 C++ 代码（如在 `exec::task` 协程里）抛异常是安全的——promise 的 `set_error(exception_ptr)` 通道会把它带回 JS 线程再转 JS 异常。
+1. **异常不得穿过 QuickJS C 帧**：所有 thunk 出口必须 try/catch 全捕获（§4.3）。FFI 边界外的 C++ 代码（如在 `stdexec::task` 协程里）抛异常是安全的——promise 的 `set_error(exception_ptr)` 通道会把它带回 JS 线程再转 JS 异常。
 2. **JSValue/JSContext 只在 JS 线程触碰**：跨线程只能用 asio post 递原生数据。若确有线程切换，`JS_UpdateStackTop(rt)`（:522）必须先调。
-3. **`exec::task` 需要 start scheduler**：脱离 `scope.spawn(sndr, env)` / `sync_wait` 环境裸 connect 一个 task 会 static_assert 失败（用法文档 §14）。绑定层内已注入，用户手写 receiver 时也要注意。
+3. **`stdexec::task` 需要 start scheduler**：脱离 `scope.spawn(sndr, env)` / `sync_wait` 环境裸 connect 一个 task 会 static_assert 失败（用法文档 §14）。绑定层内已注入，用户手写 receiver 时也要注意。
 4. **`reschedule_coroutine_on` 的类型擦除限制**：它把 scheduler 擦除进 `any_scheduler`，个别 scheduler 类型擦不进去会编译失败（用法文档 §6.4 记录了 Clang 下 `static_thread_pool` 的案例；MSVC 待验证）。稳妥选择：io scheduler 或 `single_thread_context` 的 scheduler。
 5. **spawn 链尾必须消化 error/stopped 通道**，收尾 lambda 标 `noexcept`（§5.3）。
 6. **class id per-runtime**：禁止进程级 static 存 `JSClassID`（§6.1）。
@@ -682,7 +682,7 @@ exec::task<void> point_upload(qjs::This<Point> self, std::string url) { ... }
 
 ```cpp
 #include <qjsbind/qjsbind.hpp>
-#include <exec/task.hpp>
+#include <stdexec/execution.hpp>
 #include <exec/asio/use_sender.hpp>
 #include <asio/steady_timer.hpp>
 
@@ -692,7 +692,7 @@ using qjs::This;
 double add(double a, double b) { return a + b; }
 
 // ---- 异步自由函数（★ 自由函数，不是 lambda —— §10.1）----
-exec::task<std::string> greet_after(std::string name, double ms) {
+stdexec::task<std::string> greet_after(std::string name, double ms) {
   asio::steady_timer timer{qjs::current_io(), std::chrono::milliseconds{(long long)ms}};
   co_await timer.async_wait(exec::asio::use_sender);
   co_return "hello, " + name;
@@ -704,7 +704,7 @@ struct Counter {
   int add(int d) { return value += d; }
 };
 
-exec::task<int> counter_add_later(This<Counter> self, int d, double ms) {
+stdexec::task<int> counter_add_later(This<Counter> self, int d, double ms) {
   asio::steady_timer timer{qjs::current_io(), std::chrono::milliseconds{(long long)ms}};
   co_await timer.async_wait(exec::asio::use_sender);
   co_return self->add(d);
@@ -812,4 +812,4 @@ handle 跨 Runtime 传过去，**对象仍只活在创建它的 Runtime**（线�
 | `JS_SetHostPromiseRejectionTracker` | :1177 | 未处理 rejection 监控 |
 | `exec::asio::use_sender` | stdexec `exec/asio/use_sender.hpp:220` | asio op → sender |
 | `exec::asio::asio_thread_pool` | `exec/asio/asio_thread_pool.hpp` | asio 版线程池（offload 用） |
-| `exec::task<T>` / `exec::async_scope` | `exec/task.hpp` / `exec/async_scope.hpp` | 协程类型 / 结构化并发 |
+| `stdexec::task<T>`（`std::exec::task`）/ `stdexec::counting_scope` | `stdexec/__detail/__task.hpp` / `stdexec/__detail/__counting_scopes.hpp` | 协程类型 / 结构化并发 |

@@ -8,6 +8,7 @@
 #pragma once
 
 #include <qjsbind/class.hpp>
+#include <qjsbind/std_exec.hpp>
 #include <qjsbind/context.hpp>
 #include <qjsbind/value.hpp>
 #include <qjsbind/web/errors.hpp>
@@ -19,7 +20,7 @@
 // 注：本头文件仅被链入 qjsbind_net（PUBLIC 传播 OpenSSL）的 target 使用。
 #include <openssl/evp.h>
 
-#include <exec/task.hpp>
+#include <stdexec/execution.hpp>
 
 #include <memory>
 #include <optional>
@@ -258,7 +259,7 @@ inline void check_integrity(JSContext* ctx, const std::string& integrity, int st
         throw_type_error(ctx, "fetch: integrity 校验失败");
 }
 
-inline exec::task<qjs::Value> fetch_impl(JSContext* ctx, std::shared_ptr<FetchBackend> backend,
+inline std_exec::task<qjs::Value> fetch_impl(JSContext* ctx, std::shared_ptr<FetchBackend> backend,
                                          FetchHandler chain, std::string method,
                                          std::string url, std::vector<Header> headers,
                                          std::string body, const std::string& redirect_mode,
@@ -364,7 +365,7 @@ inline void install_fetch(qjs::Context& ctx, std::shared_ptr<FetchBackend> backe
         "fetch",
         qjs::func(ctx.raw(),
                   [backend, chain](qjs::Ctx ctx, qjs::Value input, qjs::Opt<qjs::Value> init)
-                      -> exec::task<qjs::Value> {
+                      -> std_exec::task<qjs::Value> {
                       // 同步部分：解析 input/init → RequestImpl
                       RequestImpl req;
                       qjs::Opt<qjs::Value> input_opt;

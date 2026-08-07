@@ -1,7 +1,8 @@
 #include <dart_cpp_bridge/sleep.hpp>
+#include <qjsbind/std_exec.hpp>
 #include <dart_cpp_bridge/stream.hpp>
 
-#include <exec/task.hpp>
+#include <stdexec/execution.hpp>
 #include <gtest/gtest.h>
 #include <stdexec/execution.hpp>
 
@@ -12,9 +13,9 @@
 
 namespace {
 
-// 在同步上下文中运行一个 exec::task（task 本身是 sender）。
+// 在同步上下文中运行一个 std_exec::task（task 本身是 sender）。
 template <typename T>
-std::optional<T> run(exec::task<T> t)
+std::optional<T> run(std_exec::task<T> t)
 {
   auto res = stdexec::sync_wait(std::move(t));
   if (!res) return std::nullopt;

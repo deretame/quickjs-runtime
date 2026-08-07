@@ -1,6 +1,7 @@
 #include <dart_cpp_bridge/channel.hpp>
+#include <qjsbind/std_exec.hpp>
 
-#include <exec/task.hpp>
+#include <stdexec/execution.hpp>
 #include <gtest/gtest.h>
 #include <stdexec/execution.hpp>
 
@@ -15,7 +16,7 @@
 namespace {
 
 template <typename T>
-std::optional<T> run(exec::task<T> t)
+std::optional<T> run(std_exec::task<T> t)
 {
   auto res = stdexec::sync_wait(std::move(t));
   if (!res) return std::nullopt;
@@ -111,7 +112,7 @@ TEST(Channel, MpscUnboundedCloseStopsIteration)
 TEST(Channel, MpscBoundedFifo)
 {
   auto [tx, rx] = co::mpsc::bounded<int>(4);
-  auto send_res = run([&tx]() -> exec::task<bool> {
+  auto send_res = run([&tx]() -> std_exec::task<bool> {
     bool a = co_await tx.send(1);
     bool b = co_await tx.send(2);
     bool c = co_await tx.send(3);
@@ -131,12 +132,12 @@ TEST(Channel, MpscBoundedBackpressure)
   auto [tx, rx] = co::mpsc::bounded<int>(1);
   // 容量为 1：第二个 send 会 park，直到 receiver 取走一个值
   auto result = stdexec::sync_wait(stdexec::when_all(
-      [&tx]() -> exec::task<bool> {
+      [&tx]() -> std_exec::task<bool> {
         bool a = co_await tx.send(10);
         bool b = co_await tx.send(20);  // 槽满 -> 挂起等 recv
         co_return a && b;
       }(),
-      [&rx]() -> exec::task<std::optional<int>> {
+      [&rx]() -> std_exec::task<std::optional<int>> {
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
         co_return co_await rx.recv();
       }()));
@@ -151,11 +152,11 @@ TEST(Channel, MpscBoundedRendezvous)
   // capacity == 0：无缓冲，send 必须等到有 receiver 才会交付
   auto [tx, rx] = co::mpsc::bounded<int>(0);
   auto result = stdexec::sync_wait(stdexec::when_all(
-      [&tx]() -> exec::task<bool> {
+      [&tx]() -> std_exec::task<bool> {
         bool ok = co_await tx.send(99);
         co_return ok;
       }(),
-      [&rx]() -> exec::task<std::optional<int>> {
+      [&rx]() -> std_exec::task<std::optional<int>> {
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
         co_return co_await rx.recv();
       }()));

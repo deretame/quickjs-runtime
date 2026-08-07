@@ -14,6 +14,7 @@
 #pragma once
 
 #include <qjsbind/web/net.hpp>
+#include <qjsbind/std_exec.hpp>
 
 #include <net/http_backend.hpp>
 
@@ -35,14 +36,14 @@ namespace qjsbind::web {
 
 // 链尾处理器：最终落到 FetchBackend::request（fetch_impl 组装，§5.4）
 using FetchHandler =
-    std::function<exec::task<HttpResponse>(const HttpRequest& req, std::stop_token st)>;
+    std::function<std_exec::task<HttpResponse>(const HttpRequest& req, std::stop_token st)>;
 
 struct FetchInterceptor {
     virtual ~FetchInterceptor() = default;
     // co_await next 之前 = 前置相位；之后 = 后置相位。
     // req 为 const 引用、贯穿整个调用：后置相位仍可读。
     // 短路 = 不调 next 直接 co_return；重试 = 多次调 next；换传输 = 调别的 handler。
-    virtual exec::task<HttpResponse> intercept(const HttpRequest& req, std::stop_token st,
+    virtual std_exec::task<HttpResponse> intercept(const HttpRequest& req, std::stop_token st,
                                                FetchHandler next) = 0;
 };
 
@@ -155,7 +156,7 @@ public:
             upstream_->cancel();
     }
 
-    exec::task<std::optional<std::string>> read() override
+    std_exec::task<std::optional<std::string>> read() override
     {
         // 已收尾（上游 EOF 且解码器完成）→ EOF
         if (finished_)
@@ -317,7 +318,7 @@ private:
 // ---- AcceptEncodingInterceptor（设计文档 §5.6）----
 class AcceptEncodingInterceptor : public FetchInterceptor {
 public:
-    exec::task<HttpResponse> intercept(const HttpRequest& req, std::stop_token st,
+    std_exec::task<HttpResponse> intercept(const HttpRequest& req, std::stop_token st,
                                        FetchHandler next) override
     {
         // ---- 前置相位 ----
@@ -391,7 +392,7 @@ public:
             upstream_->cancel();
     }
 
-    exec::task<std::optional<std::string>> read() override
+    std_exec::task<std::optional<std::string>> read() override
     {
         auto block = co_await upstream_->read();
         if (!block) {
@@ -465,7 +466,7 @@ public:
     Socks5ProxyInterceptor(std::shared_ptr<net::BeastFetchBackend> backend, Route route)
         : backend_(std::move(backend)), route_(std::move(route)) {}
 
-    exec::task<HttpResponse> intercept(const HttpRequest& req, std::stop_token st,
+    std_exec::task<HttpResponse> intercept(const HttpRequest& req, std::stop_token st,
                                        FetchHandler next) override
     {
         if (auto proxy = route_(req.url))

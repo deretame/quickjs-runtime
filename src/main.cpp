@@ -1,11 +1,12 @@
 // 端到端演示（设计文档 §11）：同步函数 + 异步协程函数 + 类 + 事件循环
 #include <chrono>
+#include <qjsbind/std_exec.hpp>
 #include <memory>
 #include <string>
 
 #include <boost/asio/steady_timer.hpp>
 #include <exec/asio/use_sender.hpp>
-#include <exec/task.hpp>
+#include <stdexec/execution.hpp>
 #include <qjsbind/qjsbind.hpp>
 #include <spdlog/spdlog.h>
 
@@ -16,7 +17,7 @@ double add(double a, double b) { return a + b; }
 
 // ---- 异步自由函数（★ 自由函数，不是 lambda —— 见 known_issues KI-001）----
 // 无 Ctx 参数：经 qjs::current_io() 拿当前 JS 线程的事件循环
-exec::task<std::string> greet_after(std::string name, double ms)
+std_exec::task<std::string> greet_after(std::string name, double ms)
 {
     auto timer = std::make_shared<boost::asio::steady_timer>(
         qjs::current_io(), boost::asio::chrono::milliseconds(static_cast<long long>(ms)));
@@ -30,8 +31,8 @@ struct Counter {
     int add(int d) { return value += d; }
 };
 
-// 异步方法糖：This<Counter> + exec::task 自由函数，经 method() 注册
-exec::task<int> counter_add_later(This<Counter> self, int d, double ms)
+// 异步方法糖：This<Counter> + std_exec::task 自由函数，经 method() 注册
+std_exec::task<int> counter_add_later(This<Counter> self, int d, double ms)
 {
     auto timer = std::make_shared<boost::asio::steady_timer>(
         qjs::current_io(), boost::asio::chrono::milliseconds(static_cast<long long>(ms)));

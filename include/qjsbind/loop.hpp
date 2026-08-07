@@ -19,17 +19,18 @@
 namespace qjs {
 
 // ---- 统一 spawn 入口（设计文档 §8.1 不变量 1）----
-// 三路收尾消化 error/stopped（noexcept，否则 async_scope::spawn 会 terminate），
-// 并维护 pending_ 计数；env 注入 get_start_scheduler（exec::task 要求）。
+// 三路收尾消化 error/stopped（noexcept，否则 stdexec::spawn 会 static_assert），
+// 并维护 pending_ 计数；env 注入 get_start_scheduler（stdexec::task 要求）。
 template <stdexec::sender S>
 void Runtime::spawn(S&& sndr)
 {
     pending_.fetch_add(1, std::memory_order_relaxed);
-    scope_->spawn(
+    stdexec::spawn(
         std::forward<S>(sndr)
             | stdexec::then([this](auto&&...) noexcept { complete(); })
             | stdexec::upon_error([this](auto&&) noexcept { complete(); })
             | stdexec::upon_stopped([this]() noexcept { complete(); }),
+        scope_->get_token(),
         stdexec::prop{stdexec::get_start_scheduler, io_scheduler()});
 }
 
@@ -96,8 +97,13 @@ inline void Runtime::stop()
 // ---- shutdown()：单向关闭（设计文档 §8.3）----
 inline void Runtime::shutdown()
 {
-    if (shutdown_done_.load(std::memory_order_acquire))
+    if (shutdown_done_.load(std::memory_order_acquire)) {
+        // 多轮 eval+run 的脚本模式：request_stop 只发一次，但每轮
+        // run_to_completion 结束都要把当轮 scope_ 的关联收干净并重建
+        //（counting_scope 析构要求无在飞关联，见下）。
+        finish_scope();
         return;
+    }
     shutdown_done_.store(true, std::memory_order_release);
 
     if (pending_.load(std::memory_order_acquire) != 0) {
@@ -121,9 +127,19 @@ inline void Runtime::shutdown()
     }
     guard_.reset(); // 4. 解除保活
 
-    // 5. request_stop 是单向的：重建 scope_（新 stop_source），
-    //    使 run_to_completion 可重复调用（多轮 eval+run 的脚本模式）
-    scope_ = std::make_unique<exec::async_scope>();
+    finish_scope(); // 5. 见下
+}
+
+// join + 重建 scope_：request_stop 单向，但 counting_scope 析构要求无在飞
+// 关联（spawn 的 op 已完成但 association 未释放时析构会 terminate）。
+// basic_task 的完成/帧销毁可能 post 回 start scheduler（调度亲和），先排干
+// io 再 join，避免 join 在残余 post 未执行时提前完成。
+inline void Runtime::finish_scope()
+{
+    while (io_.poll_one() > 0) {
+    }
+    stdexec::sync_wait(scope_->join());
+    scope_ = std::make_unique<stdexec::counting_scope>();
 }
 
 } // namespace qjs

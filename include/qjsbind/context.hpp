@@ -20,7 +20,6 @@
 #include <boost/uuid/uuid_io.hpp>
 
 #include <exec/asio/use_sender.hpp>
-#include <exec/async_scope.hpp>
 #include <stdexec/execution.hpp>
 
 #include <quickjs.h>
@@ -213,6 +212,7 @@ public:
 
 private:
     void complete() noexcept { pending_.fetch_sub(1, std::memory_order_acq_rel); }
+    void finish_scope(); // 见 loop.hpp：join + 重建 scope_
     void loop_body();
 
     std::string id_;
@@ -220,7 +220,7 @@ private:
     JSContext* ctx_ = nullptr;
     boost::asio::io_context io_; // 见设计文档 §5/§8（成员声明顺序保证销毁次序）
     // scope_ 在 shutdown() 后重建（request_stop 单向，见 loop.hpp）
-    std::unique_ptr<exec::async_scope> scope_ = std::make_unique<exec::async_scope>();
+    std::unique_ptr<stdexec::counting_scope> scope_ = std::make_unique<stdexec::counting_scope>();
     std::atomic<std::ptrdiff_t> pending_{0};
     std::atomic<bool> done_{false};
     std::atomic<bool> shutdown_done_{false};

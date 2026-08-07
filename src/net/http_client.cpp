@@ -1,5 +1,6 @@
 ﻿// qjsbind_net 网络层实现 —— 见 http_client.hpp 设计注释
 #include "net/http_backend.hpp"
+#include <qjsbind/std_exec.hpp>
 #include "net/http_client.hpp"
 
 #include <boost/asio/ssl.hpp>
@@ -151,7 +152,7 @@ struct ResponseHead {
 // parser 以 shared_ptr 传入：beast 的 response_parser 不可移动，且 body 阶段需要
 // 同一 parser 继续 async_read_some（由 BeastBodySource 持有）。
 template <class Stream>
-exec::task<std::pair<ResponseHead, beast::flat_buffer>>
+std_exec::task<std::pair<ResponseHead, beast::flat_buffer>>
 do_exchange_head(Stream& stream, const HttpRequest& req, const ParsedUrl& url,
                  std::shared_ptr<http::response_parser<http::buffer_body>> parser) {
     http::request<http::string_body> hreq = make_beast_request(req, url);
@@ -208,7 +209,7 @@ public:
         });
     }
 
-    exec::task<std::optional<std::string>> read() override
+    std_exec::task<std::optional<std::string>> read() override
     {
         for (;;) {
             if (parser_->is_done()) {
@@ -266,7 +267,7 @@ private:
 // 建立到目标的 TCP 连接：直连（resolver + connect）或经 SOCKS5 隧道（§3.4）。
 // 返回共享 socket：调用方在其上挂取消回调（connect / socks5 握手 / TLS 握手 /
 // 读头全程可取消；body 阶段由 BeastBodySource 接管）。
-exec::task<std::shared_ptr<tcp::socket>>
+std_exec::task<std::shared_ptr<tcp::socket>>
 connect_tcp(boost::asio::io_context& io, const std::string& host, const std::string& port,
             std::stop_token st, const std::optional<Socks5Proxy>& proxy)
 {
@@ -297,7 +298,7 @@ connect_tcp(boost::asio::io_context& io, const std::string& host, const std::str
     co_return sock;
 }
 
-exec::task<HttpResponse> http_request(boost::asio::io_context& io, HttpRequest req,
+std_exec::task<HttpResponse> http_request(boost::asio::io_context& io, HttpRequest req,
                                       TlsOptions tls, std::stop_token st,
                                       std::optional<Socks5Proxy> proxy) {
     const ParsedUrl url = parse_url(req.url);
@@ -384,14 +385,14 @@ web::HttpResponse web_response_from_net(HttpResponse resp)
 }
 } // namespace
 
-exec::task<web::HttpResponse> BeastFetchBackend::request(const web::HttpRequest& req,
+std_exec::task<web::HttpResponse> BeastFetchBackend::request(const web::HttpRequest& req,
                                                          std::stop_token st) {
     HttpResponse resp = co_await http_request(io_, net_request_from_web(req), tls_,
                                               std::move(st), std::nullopt);
     co_return web_response_from_net(std::move(resp));
 }
 
-exec::task<web::HttpResponse> BeastFetchBackend::request_via_socks5(
+std_exec::task<web::HttpResponse> BeastFetchBackend::request_via_socks5(
     const web::HttpRequest& req, const Socks5Proxy& proxy, std::stop_token st) {
     HttpResponse resp = co_await http_request(io_, net_request_from_web(req), tls_,
                                               std::move(st), proxy);

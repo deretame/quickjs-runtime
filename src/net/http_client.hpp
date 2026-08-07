@@ -1,6 +1,6 @@
 ﻿// qjsbind_net —— boost::beast + OpenSSL 的 HTTP/HTTPS 客户端（静态库，非 header-only）
 //
-// 设计：单次请求（不含重定向），协程化（exec::task）。v2 流式：
+// 设计：单次请求（不含重定向），协程化（std_exec::task）。v2 流式：
 //   - request() 读出头即返回；body 由 BeastBodySource（web::BodySource）流式交出，
 //     读取路径：read() → http::async_read_some（64 KiB 块），EOF 由
 //     response_parser<buffer_body> 的 is_done() 判定（chunked / content-length /
@@ -20,10 +20,11 @@
 #pragma once
 
 #include <qjsbind/web/net.hpp>
+#include <qjsbind/std_exec.hpp>
 
 #include "socks5.hpp"
 
-#include <exec/task.hpp>
+#include <stdexec/execution.hpp>
 #include <stop_token>
 #include <string>
 #include <vector>
@@ -57,7 +58,7 @@ struct TlsOptions {
 // 执行一次 HTTP 请求：读出头即返回，body 由响应流提供。
 // 头前失败抛 boost::system::system_error（含 TLS/解析/网络错误）。
 // proxy 非空 → 经 SOCKS5 隧道交换（https 在隧道上照常 TLS handshake，§3.4）。
-exec::task<HttpResponse> http_request(boost::asio::io_context& io, HttpRequest req,
+std_exec::task<HttpResponse> http_request(boost::asio::io_context& io, HttpRequest req,
                                       TlsOptions tls, std::stop_token st,
                                       std::optional<Socks5Proxy> proxy = std::nullopt);
 

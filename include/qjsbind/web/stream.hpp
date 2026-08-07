@@ -18,6 +18,7 @@
 #pragma once
 
 #include <qjsbind/web/net.hpp>
+#include <qjsbind/std_exec.hpp>
 
 #include <qjsbind/qjsbind.hpp>
 
@@ -101,7 +102,7 @@ inline void wake_all(Head& head, Tail& tail)
 class MemorySource : public BodySource {
 public:
     explicit MemorySource(std::string bytes) : bytes_(std::move(bytes)) {}
-    exec::task<std::optional<std::string>> read() override
+    std_exec::task<std::optional<std::string>> read() override
     {
         if (done_)
             co_return std::nullopt;
@@ -148,7 +149,7 @@ public:
         return {a, b};
     }
 
-    exec::task<std::optional<std::string>> read() override
+    std_exec::task<std::optional<std::string>> read() override
     {
         for (;;) {
             if (sh_->errored)
@@ -308,7 +309,7 @@ struct ReadableStreamImpl : public std::enable_shared_from_this<ReadableStreamIm
     // 挂起：进 pending FIFO 并触发一次 source pull（pumping 串行化并发 pull）。
     // abort（stop_requested）→ 以 stopped 完成 → reject AbortError。
     // source 抛异常 → 状态 Errored，挂起及后续 read() 以该 error 结束。
-    exec::task<std::optional<std::string>> read()
+    std_exec::task<std::optional<std::string>> read()
     {
         disturbed = true;
         for (;;) {
@@ -572,7 +573,7 @@ inline void install_readable_stream(qjs::Context& ctx)
         })
         .method("read", [](qjs::Ctx ctx,
                            qjs::This<ReadableStreamDefaultReaderBinding> self)
-                    -> exec::task<qjs::Value> {
+                    -> std_exec::task<qjs::Value> {
             // 副本：挂起期间 JS 对象可被 GC，impl 必须存活
             std::shared_ptr<ReadableStreamImpl> impl = self->impl;
             std::optional<std::string> block;

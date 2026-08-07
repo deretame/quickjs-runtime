@@ -1,12 +1,13 @@
 // M3 异步绑定验收测试：sender → Promise + 事件循环
 //
 // 验收（设计文档 §12 M3）：
-//   - 协程函数 JS 侧 await 成功（exec::task 自动识别为 Promise）
+//   - 协程函数 JS 侧 await 成功（std_exec::task 自动识别为 Promise）
 //   - asio timer 联通（use_sender）
 //   - C++ 异常 → reject
 //   - 取消（stop）→ AbortError reject
 //   - run_to_completion 退出判据（pending_ == 0）
 #include <atomic>
+#include <qjsbind/std_exec.hpp>
 #include <chrono>
 #include <thread>
 #include <exception>
@@ -14,7 +15,7 @@
 
 #include <boost/asio/steady_timer.hpp>
 #include <exec/asio/use_sender.hpp>
-#include <exec/task.hpp>
+#include <stdexec/execution.hpp>
 #include <gtest/gtest.h>
 #include <qjsbind/qjsbind.hpp>
 
@@ -23,12 +24,12 @@ using namespace qjs;
 namespace {
 
 // ---- 异步被测函数（自由函数，MSVC 协程限制，设计文档 §10.1）----
-exec::task<int> add_async(int a, int b)
+std_exec::task<int> add_async(int a, int b)
 {
     co_return a + b; // 同步完成的 task：无 suspend 点
 }
 
-exec::task<double> wait_and_value(Ctx c, double v, int ms)
+std_exec::task<double> wait_and_value(Ctx c, double v, int ms)
 {
     // Ctx 注入 → 拿 runtime 的 io_context；timer 生命周期由协程帧保证
     auto timer = std::make_shared<boost::asio::steady_timer>(
@@ -37,7 +38,7 @@ exec::task<double> wait_and_value(Ctx c, double v, int ms)
     co_return v;
 }
 
-exec::task<std::string> fail_async()
+std_exec::task<std::string> fail_async()
 {
     throw std::runtime_error("async-boom");
     co_return "";
@@ -45,7 +46,7 @@ exec::task<std::string> fail_async()
 
 // 协作式取消：任务轮询 stop token，被取消则提前完成（resolve 带标记）
 // started 是确定性同步点：协程真正开始轮询后置位（避免 stop 时序竞态）
-exec::task<std::string> cancellable_poll(Ctx c, std::shared_ptr<std::atomic<bool>> started,
+std_exec::task<std::string> cancellable_poll(Ctx c, std::shared_ptr<std::atomic<bool>> started,
     std::string msg)
 {
     auto stop = co_await stdexec::get_stop_token();
@@ -60,7 +61,7 @@ exec::task<std::string> cancellable_poll(Ctx c, std::shared_ptr<std::atomic<bool
 }
 
 // 立即 set_stopped 的 sender（验证 set_stopped → AbortError reject 管道）
-exec::task<void> stop_now()
+std_exec::task<void> stop_now()
 {
     co_await stdexec::just_stopped();
     co_return;
@@ -111,14 +112,14 @@ TEST_F(M3Fixture, ExceptionRejects)
     EXPECT_NE(msg.find("async-boom"), std::string::npos);
 }
 
-// ---- stop() 传播到任务（exec::task 取消语义：stop → 任务 set_stopped → AbortError reject）----
+// ---- stop() 传播到任务（std_exec::task 取消语义：stop → 任务 set_stopped → AbortError reject）----
 TEST_F(M3Fixture, StopPropagatesToTask)
 {
     auto started = std::make_shared<std::atomic<bool>>(false);
     globals.set("cancellablePoll", [started](Ctx c, std::string msg) {
         return cancellable_poll(c, started, std::move(msg));
     });
-    // 任务挂起在 timer await 时收到 stop：exec::task 走 set_stopped（协程体不再继续），
+    // 任务挂起在 timer await 时收到 stop：std_exec::task 走 set_stopped（协程体不再继续），
     // 结算为 AbortError reject（设计文档 §5.5/§8.3）
     ctx.eval(
         "cancellablePoll('t').then(v => { globalThis.__r = v; }, e => { globalThis.__err = e.name; });");

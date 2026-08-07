@@ -2,7 +2,8 @@
 #pragma once
 
 #include <boost/asio/ip/tcp.hpp>
-#include <exec/task.hpp>
+#include <qjsbind/std_exec.hpp>
+#include <stdexec/execution.hpp>
 
 #include <cstdint>
 #include <memory>
@@ -25,7 +26,7 @@ struct Socks5Proxy {
 // 取消：stop_token 注册期间 socket cancel()（握手阶段也可被取消 → stopped）。
 // 注：返回 shared_ptr（而非设计文档草稿的 tcp::socket 值）——与 BeastBodySource /
 //    stop_callback 的 shared_ptr 生命周期模型一致（隧道 socket 移交 body 阶段继续用）。
-exec::task<std::shared_ptr<boost::asio::ip::tcp::socket>>
+std_exec::task<std::shared_ptr<boost::asio::ip::tcp::socket>>
 socks5_connect(boost::asio::io_context& io, const Socks5Proxy& proxy,
                std::string_view target_host, uint16_t target_port, std::stop_token st);
 

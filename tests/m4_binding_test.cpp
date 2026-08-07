@@ -4,9 +4,10 @@
 //   - 端到端示例（§11）跑通
 //   - qjs::Function 回调：JS 函数作参数传入 C++ 并调用
 //   - Module 导出：ESM import 原生模块（func + class）
-//   - 异步方法糖：method 注册 This<Counter> + exec::task 自由函数
+//   - 异步方法糖：method 注册 This<Counter> + std_exec::task 自由函数
 //   - 多 Runtime 并行：两个 Runtime 各一线程 + channel 互通 + 统一 stop/join
 #include <atomic>
+#include <qjsbind/std_exec.hpp>
 #include <chrono>
 #include <memory>
 #include <string>
@@ -15,7 +16,7 @@
 #include <boost/asio/steady_timer.hpp>
 #include <dart_cpp_bridge/channel.hpp>
 #include <exec/asio/use_sender.hpp>
-#include <exec/task.hpp>
+#include <stdexec/execution.hpp>
 #include <gtest/gtest.h>
 #include <qjsbind/qjsbind.hpp>
 
@@ -27,7 +28,7 @@ namespace {
 double add(double a, double b) { return a + b; }
 
 // 异步自由函数：无 Ctx 参数，经 current_io() 拿事件循环（§11 示例）
-exec::task<std::string> greet_after(std::string name, double ms)
+std_exec::task<std::string> greet_after(std::string name, double ms)
 {
     auto timer = std::make_shared<boost::asio::steady_timer>(
         current_io(), boost::asio::chrono::milliseconds(static_cast<long long>(ms)));
@@ -46,8 +47,8 @@ struct Point {
     explicit Point(int v) : value(v) {}
 };
 
-// 异步方法糖：This<Counter> + exec::task 自由函数，method() 注册
-exec::task<int> counter_add_later(This<Counter> self, int d, double ms)
+// 异步方法糖：This<Counter> + std_exec::task 自由函数，method() 注册
+std_exec::task<int> counter_add_later(This<Counter> self, int d, double ms)
 {
     auto timer = std::make_shared<boost::asio::steady_timer>(
         current_io(), boost::asio::chrono::milliseconds(static_cast<long long>(ms)));

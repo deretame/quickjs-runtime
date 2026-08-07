@@ -8,7 +8,8 @@
 // 承担（命令式、可能跨线程）；请求头之前的失败仍由 request() 抛异常。
 #pragma once
 
-#include <exec/task.hpp>
+#include <stdexec/execution.hpp>
+#include <qjsbind/std_exec.hpp>
 #include <stop_token>
 #include <memory>
 #include <optional>
@@ -35,7 +36,7 @@ struct HttpRequest {
 // cancel()：尽力取消（关闭 socket、释放资源），幂等，可能在其他线程触发。
 struct BodySource {
     virtual ~BodySource() = default;
-    virtual exec::task<std::optional<std::string>> read() = 0;
+    virtual std_exec::task<std::optional<std::string>> read() = 0;
     virtual void cancel() = 0;
 };
 
@@ -52,7 +53,7 @@ struct FetchBackend {
     // 单次请求（不含重定向）。读出头即返回，body 尚未读完（由 resp.body 流提供）。
     // 头前失败（DNS/连接/TLS/写请求/读头）抛 std::exception。
     // req 为 const 引用：调用方（拦截器链）需要保留本跳最终请求供后置相位读取。
-    virtual exec::task<HttpResponse> request(const HttpRequest& req, std::stop_token st) = 0;
+    virtual std_exec::task<HttpResponse> request(const HttpRequest& req, std::stop_token st) = 0;
 };
 
 } // namespace qjsbind::web

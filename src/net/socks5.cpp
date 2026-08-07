@@ -1,5 +1,6 @@
 // SOCKS5 握手实现（RFC 1928 + RFC 1929 子协商）
 #include "socks5.hpp"
+#include <qjsbind/std_exec.hpp>
 
 #include <boost/asio.hpp>
 #include <exec/asio/use_sender.hpp>
@@ -87,7 +88,7 @@ std::string build_target(std::string_view host)
 
 } // namespace
 
-exec::task<std::shared_ptr<boost::asio::ip::tcp::socket>>
+std_exec::task<std::shared_ptr<boost::asio::ip::tcp::socket>>
 socks5_connect(boost::asio::io_context& io, const Socks5Proxy& proxy,
                std::string_view target_host, uint16_t target_port, std::stop_token st)
 {

@@ -6,6 +6,7 @@
 #pragma once
 
 #include <qjsbind/class.hpp>
+#include <qjsbind/std_exec.hpp>
 #include <qjsbind/context.hpp>
 #include <qjsbind/rt_value.hpp>
 #include <qjsbind/value.hpp>
@@ -16,7 +17,7 @@
 #include <qjsbind/web/net.hpp>
 #include <qjsbind/web/url.hpp>
 
-#include <exec/task.hpp>
+#include <stdexec/execution.hpp>
 
 #include <optional>
 #include <cstdlib>
@@ -163,7 +164,7 @@ inline qjs::Value consume_blob(JSContext* ctx, const std::string& bytes, const s
 // 以 stopped 结束 → reject AbortError）；读 body 中途失败 → reject TypeError
 // （fetch 已 resolve，见 docs/fetch_streaming_design.md §3.3）。
 template <class Self, class Fn>
-exec::task<qjs::Value> consume_impl(JSContext* ctx, Self& self, const char* what, Fn&& fn) {
+std_exec::task<qjs::Value> consume_impl(JSContext* ctx, Self& self, const char* what, Fn&& fn) {
     // 前置检查（设计文档 §4.3）：locked → TypeError；disturbed → TypeError
     if (self.body_stream && self.body_stream->locked())
         throw_type_error(ctx, "%s: body 已被 reader 锁定", what);
@@ -607,23 +608,23 @@ inline void install_request(qjs::Context& ctx) {
                        return qjs::Value(ctx.ctx, qjs::js_convert<RequestImpl>::to_js(ctx.ctx, c));
                    })
                    .method("text", [](qjs::Ctx ctx, qjs::This<RequestImpl> self)
-                               -> exec::task<qjs::Value> {
+                               -> std_exec::task<qjs::Value> {
                        co_return co_await consume_impl(ctx.ctx, *self, "Request", consume_text);
                    })
                    .method("json", [](qjs::Ctx ctx, qjs::This<RequestImpl> self)
-                               -> exec::task<qjs::Value> {
+                               -> std_exec::task<qjs::Value> {
                        co_return co_await consume_impl(ctx.ctx, *self, "Request", consume_json);
                    })
                    .method("arrayBuffer", [](qjs::Ctx ctx, qjs::This<RequestImpl> self)
-                               -> exec::task<qjs::Value> {
+                               -> std_exec::task<qjs::Value> {
                        co_return co_await consume_impl(ctx.ctx, *self, "Request", consume_array_buffer);
                    })
                    .method("bytes", [](qjs::Ctx ctx, qjs::This<RequestImpl> self)
-                               -> exec::task<qjs::Value> {
+                               -> std_exec::task<qjs::Value> {
                        co_return co_await consume_impl(ctx.ctx, *self, "Request", consume_bytes);
                    })
                    .method("formData",
-                           [](qjs::Ctx ctx, qjs::This<RequestImpl> self) -> exec::task<qjs::Value> {
+                           [](qjs::Ctx ctx, qjs::This<RequestImpl> self) -> std_exec::task<qjs::Value> {
                                const std::string ct = content_type_of(ctx.ctx, *self);
                                const std::string essence = mime_essence(ct);
                                // 规范：essence 不是 multipart/urlencoded → TypeError
@@ -662,7 +663,7 @@ inline void install_request(qjs::Context& ctx) {
                                    });
                            })
                    .method("blob", [](qjs::Ctx ctx, qjs::This<RequestImpl> self)
-                               -> exec::task<qjs::Value> {
+                               -> std_exec::task<qjs::Value> {
                        const std::string ct =
                            content_type_of(ctx.ctx, *self);
                        co_return co_await consume_impl(
@@ -879,23 +880,23 @@ inline void install_response(qjs::Context& ctx) {
                        return qjs::Value(ctx.ctx, qjs::js_convert<ResponseImpl>::to_js(ctx.ctx, c));
                    })
                    .method("text", [](qjs::Ctx ctx, qjs::This<ResponseImpl> self)
-                               -> exec::task<qjs::Value> {
+                               -> std_exec::task<qjs::Value> {
                        co_return co_await consume_impl(ctx.ctx, *self, "Response", consume_text);
                    })
                    .method("json", [](qjs::Ctx ctx, qjs::This<ResponseImpl> self)
-                               -> exec::task<qjs::Value> {
+                               -> std_exec::task<qjs::Value> {
                        co_return co_await consume_impl(ctx.ctx, *self, "Response", consume_json);
                    })
                    .method("arrayBuffer", [](qjs::Ctx ctx, qjs::This<ResponseImpl> self)
-                               -> exec::task<qjs::Value> {
+                               -> std_exec::task<qjs::Value> {
                        co_return co_await consume_impl(ctx.ctx, *self, "Response", consume_array_buffer);
                    })
                    .method("bytes", [](qjs::Ctx ctx, qjs::This<ResponseImpl> self)
-                               -> exec::task<qjs::Value> {
+                               -> std_exec::task<qjs::Value> {
                        co_return co_await consume_impl(ctx.ctx, *self, "Response", consume_bytes);
                    })
                    .method("formData",
-                           [](qjs::Ctx ctx, qjs::This<ResponseImpl> self) -> exec::task<qjs::Value> {
+                           [](qjs::Ctx ctx, qjs::This<ResponseImpl> self) -> std_exec::task<qjs::Value> {
                                const std::string ct = content_type_of(ctx.ctx, *self);
                                const std::string essence = mime_essence(ct);
                                if (essence != "multipart/form-data" &&
@@ -930,7 +931,7 @@ inline void install_response(qjs::Context& ctx) {
                                    });
                            })
                    .method("blob", [](qjs::Ctx ctx, qjs::This<ResponseImpl> self)
-                               -> exec::task<qjs::Value> {
+                               -> std_exec::task<qjs::Value> {
                        const std::string ct =
                            content_type_of(ctx.ctx, *self);
                        co_return co_await consume_impl(

@@ -23,6 +23,7 @@ find_package(unofficial-brotli CONFIG REQUIRED)
 find_package(utf8cpp CONFIG REQUIRED)
 find_package(stdexec CONFIG REQUIRED)
 find_package(qjs CONFIG REQUIRED)
+find_package(lexbor CONFIG REQUIRED)
 find_package(GTest CONFIG REQUIRED)
 
 # ---- dart_cpp_bridge：header-only 异步库（co::stream + co::channel）----
@@ -53,6 +54,7 @@ target_link_libraries(qjsbind_net PUBLIC
     unofficial::brotli::brotlidec
     unofficial::brotli::brotlicommon
     STDEXEC::stdexec
+    lexbor::lexbor
 )
 
 # ---- 主程序 ----
@@ -81,6 +83,9 @@ add_executable(quickjs_runtime_tests
     tests/fetch_test.cpp
     tests/wpt_runner.cpp
     tests/socks5_test.cpp
+    tests/cheerio_test.cpp
+    tests/cheerio_spec_runner.cpp
+    tests/mini_task_test.cpp
 )
 target_link_libraries(quickjs_runtime_tests PRIVATE
     qjs
@@ -93,5 +98,13 @@ target_link_libraries(quickjs_runtime_tests PRIVATE
     unofficial::brotli::brotlienc
     ZLIB::ZLIB
 )
+
+target_compile_definitions(quickjs_runtime_tests PRIVATE
+    CHEERIO_TEST_DIR="${CMAKE_SOURCE_DIR}/tests/cheerio")
+# Debug 构建 JS_CallInternal 栈帧 ~21KB：默认 1MB 线程栈下 ~48 层 JS 递归
+# 即崩（QuickJS 栈检查被 __chkstk 抢先）。给测试进程 16MB 栈。
+set_target_properties(quickjs_runtime_tests PROPERTIES
+    LINK_FLAGS "/STACK:16777216")
+
 include(GoogleTest)
 gtest_discover_tests(quickjs_runtime_tests)

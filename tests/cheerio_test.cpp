@@ -138,3 +138,16 @@ TEST_F(CheerioFixture, PreprocessRegex)
     ASSERT_FALSE(r.is_exception());
     EXPECT_EQ(r.as<std::string>(), "li:first-child|li:last-child");
 }
+
+// nth-* 只统计元素子节点（text/comment 不计）——回归：span 前有文本兄弟，
+// 仍应匹配 :nth-last-child(1) 与 :first-child
+TEST_F(CheerioFixture, NthChildCountsElementsOnly)
+{
+    Value r = ctx.eval(
+        "const $ = cheerio.load('<div>text<span id=\"s\"></span></div>');"
+        "$('#s').is(':nth-last-child(1)') + '|' + $('#s').is(':first-child')"
+        "+ '|' + $('#s').is(':nth-child(1)') + '|' + $('#s').is(':only-child')"
+        "+ '|' + $('#s').is(':last-child')");
+    ASSERT_FALSE(r.is_exception()) << r.as<std::string>();
+    EXPECT_EQ(r.as<std::string>(), "true|true|true|true|true");
+}

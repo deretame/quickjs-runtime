@@ -377,7 +377,8 @@ inline qjs::Value lexbor_parse(qjs::Ctx ctx, std::string html, bool is_document,
 // 选择器匹配（在 JS 树上，lexbor 解析的 selector 结构）
 // ---------------------------------------------------------------------------
 
-// 元素在父 children 中的 1-based index（仅统计元素？nth-child 统计所有子节点）
+// 元素在父元素子节点中的 1-based index（CSS :nth-child 只统计元素兄弟，
+// text/comment 不计）
 inline int64_t child_index(JSContext* ctx, JSValue el)
 {
     qjs::Value parent = js_get(ctx, el, "parent");
@@ -388,10 +389,14 @@ inline int64_t child_index(JSContext* ctx, JSValue el)
         return -1;
     uint32_t len = 0;
     js_array_length(ctx, children.raw(), &len);
+    int64_t idx = 0;
     for (uint32_t i = 0; i < len; ++i) {
         qjs::Value c(ctx, JS_GetPropertyUint32(ctx, children.raw(), i));
+        if (!js_is_element(ctx, c.raw()))
+            continue;
+        ++idx;
         if (JS_IsStrictEqual(ctx, c.raw(), el))
-            return (int64_t)i + 1;
+            return idx;
     }
     return -1;
 }
@@ -648,39 +653,33 @@ struct SelectorMatcher {
     {
         switch (type) {
             case LXB_CSS_SELECTOR_PSEUDO_CLASS_FIRST_CHILD: {
-                qjs::Value parent = js_get(ctx, el, "parent");
-                if (!parent.is_object())
-                    return false;
-                qjs::Value children = js_get(ctx, parent.raw(), "children");
-                if (!children.is_array())
-                    return false;
-                qjs::Value first(ctx, JS_GetPropertyUint32(ctx, children.raw(), 0));
-                return JS_IsStrictEqual(ctx, first.raw(), el);
+                return child_index(ctx, el) == 1;
             }
             case LXB_CSS_SELECTOR_PSEUDO_CLASS_LAST_CHILD: {
-                qjs::Value parent = js_get(ctx, el, "parent");
-                if (!parent.is_object())
-                    return false;
-                qjs::Value children = js_get(ctx, parent.raw(), "children");
-                if (!children.is_array())
-                    return false;
-                uint32_t len = 0;
-                js_array_length(ctx, children.raw(), &len);
-                if (len == 0)
-                    return false;
-                qjs::Value last(ctx, JS_GetPropertyUint32(ctx, children.raw(), len - 1));
-                return JS_IsStrictEqual(ctx, last.raw(), el);
+                // el 之后没有元素兄弟
+                qjs::Value next = js_get(ctx, el, "next");
+                while (next.is_object()) {
+                    if (js_is_element(ctx, next.raw()))
+                        return false;
+                    next = js_get(ctx, next.raw(), "next");
+                }
+                return true;
             }
             case LXB_CSS_SELECTOR_PSEUDO_CLASS_ONLY_CHILD: {
-                qjs::Value parent = js_get(ctx, el, "parent");
-                if (!parent.is_object())
-                    return false;
-                qjs::Value children = js_get(ctx, parent.raw(), "children");
-                if (!children.is_array())
-                    return false;
-                uint32_t len = 0;
-                js_array_length(ctx, children.raw(), &len);
-                return len == 1;
+                // 前后都没有元素兄弟
+                qjs::Value prev = js_get(ctx, el, "prev");
+                while (prev.is_object()) {
+                    if (js_is_element(ctx, prev.raw()))
+                        return false;
+                    prev = js_get(ctx, prev.raw(), "prev");
+                }
+                qjs::Value next = js_get(ctx, el, "next");
+                while (next.is_object()) {
+                    if (js_is_element(ctx, next.raw()))
+                        return false;
+                    next = js_get(ctx, next.raw(), "next");
+                }
+                return true;
             }
             case LXB_CSS_SELECTOR_PSEUDO_CLASS_FIRST_OF_TYPE: {
                 qjs::Value name_v = js_get(ctx, el, "name");
@@ -783,12 +782,14 @@ struct SelectorMatcher {
                     return false;
                 int64_t pos = idx;
                 if (type == LXB_CSS_SELECTOR_PSEUDO_CLASS_FUNCTION_NTH_LAST_CHILD) {
-                    // 从后数：需要父 children 总数
-                    qjs::Value parent = js_get(ctx, el, "parent");
-                    qjs::Value children = js_get(ctx, parent.raw(), "children");
-                    uint32_t len = 0;
-                    js_array_length(ctx, children.raw(), &len);
-                    pos = (int64_t)len - idx + 1;
+                    // 从后数：沿 next 链数元素兄弟（len 含 text/comment，不可用）
+                    pos = 1;
+                    qjs::Value next = js_get(ctx, el, "next");
+                    while (next.is_object()) {
+                        if (js_is_element(ctx, next.raw()))
+                            ++pos;
+                        next = js_get(ctx, next.raw(), "next");
+                    }
                 }
                 return anb_match(anb->anb.a, anb->anb.b, pos);
             }
@@ -813,7 +814,7 @@ struct SelectorMatcher {
                         }
                         next = js_get(ctx, next.raw(), "next");
                     }
-                    idx = total + 1 - (idx - 1);
+                    idx = total + 1; // 从后数位置 = 后续同类型兄弟数 + 1
                 }
                 return anb_match(anb->anb.a, anb->anb.b, idx);
             }

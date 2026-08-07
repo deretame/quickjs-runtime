@@ -450,7 +450,7 @@ struct SelectorMatcher {
         while (head->prev != nullptr && head->combinator == LXB_CSS_SELECTOR_COMBINATOR_CLOSE)
             head = head->prev;
         for (lxb_css_selector_t* s = head;; s = s->next) {
-            if (!match_simple(s, el))
+            if (!match_simple(s, el, depth))
                 return false;
             if (s == sel)
                 break;
@@ -502,8 +502,9 @@ struct SelectorMatcher {
         }
     }
 
-    // 简单选择器匹配（含伪类）
-    bool match_simple(lxb_css_selector_t* sel, JSValue el)
+    // 简单选择器匹配（含伪类）；depth 沿 :not/:is/:where/:has 嵌套传递，
+    // 防伪类相互递归（自环 children + :has）无界栈溢出。
+    bool match_simple(lxb_css_selector_t* sel, JSValue el, int depth = 0)
     {
         switch (sel->type) {
             case LXB_CSS_SELECTOR_TYPE_ANY:
@@ -536,10 +537,10 @@ struct SelectorMatcher {
                 return match_attribute(sel, el);
 
             case LXB_CSS_SELECTOR_TYPE_PSEUDO_CLASS:
-                return match_pseudo(sel->u.pseudo.type, sel, el);
+                return match_pseudo(sel->u.pseudo.type, sel, el, depth);
 
             case LXB_CSS_SELECTOR_TYPE_PSEUDO_CLASS_FUNCTION:
-                return match_pseudo_function(sel->u.pseudo.type, sel, el);
+                return match_pseudo_function(sel->u.pseudo.type, sel, el, depth);
 
             case LXB_CSS_SELECTOR_TYPE_PSEUDO_ELEMENT:
             case LXB_CSS_SELECTOR_TYPE_PSEUDO_ELEMENT_FUNCTION:
@@ -657,7 +658,8 @@ struct SelectorMatcher {
         }
     }
 
-    bool match_pseudo(unsigned type, lxb_css_selector_t* sel, JSValue el)
+    // 伪类匹配；depth 沿 :not/:is/:where/:has 嵌套传递（防相互递归栈溢出）
+    bool match_pseudo(unsigned type, lxb_css_selector_t* sel, JSValue el, int depth = 0)
     {
         switch (type) {
             case LXB_CSS_SELECTOR_PSEUDO_CLASS_FIRST_CHILD: {
@@ -777,7 +779,8 @@ struct SelectorMatcher {
         }
     }
 
-    bool match_pseudo_function(unsigned type, lxb_css_selector_t* sel, JSValue el)
+    // 伪类函数匹配；depth 沿 :not/:is/:where/:has 嵌套传递（防相互递归栈溢出）
+    bool match_pseudo_function(unsigned type, lxb_css_selector_t* sel, JSValue el, int depth = 0)
     {
         switch (type) {
             case LXB_CSS_SELECTOR_PSEUDO_CLASS_FUNCTION_NTH_CHILD:
@@ -830,21 +833,21 @@ struct SelectorMatcher {
                 auto* list = (lxb_css_selector_list_t*)sel->u.pseudo.data;
                 if (!list)
                     return true;
-                return !match_any_list(list, el);
+                return !match_any_list(list, el, depth + 1);
             }
             case LXB_CSS_SELECTOR_PSEUDO_CLASS_FUNCTION_IS:
             case LXB_CSS_SELECTOR_PSEUDO_CLASS_FUNCTION_WHERE: {
                 auto* list = (lxb_css_selector_list_t*)sel->u.pseudo.data;
                 if (!list)
                     return false;
-                return match_any_list(list, el);
+                return match_any_list(list, el, depth + 1);
             }
             case LXB_CSS_SELECTOR_PSEUDO_CLASS_FUNCTION_HAS: {
                 // :has(sel)：el 的后代（含自身？标准为后代）中任一匹配
                 auto* list = (lxb_css_selector_list_t*)sel->u.pseudo.data;
                 if (!list)
                     return false;
-                return has_descendant_match(list, el);
+                return has_descendant_match(list, el, depth + 1);
             }
             case LXB_CSS_SELECTOR_PSEUDO_CLASS_FUNCTION_LEXBOR_CONTAINS: {
                 auto* c = (lxb_css_selector_contains_t*)sel->u.pseudo.data;
@@ -863,11 +866,13 @@ struct SelectorMatcher {
         }
     }
 
-    // selector list（逗号分隔）任一链匹配 el
-    bool match_any_list(lxb_css_selector_list_t* list, JSValue el)
+    // selector list（逗号分隔）任一链匹配 el；depth 透传（防伪类嵌套递归）
+    bool match_any_list(lxb_css_selector_list_t* list, JSValue el, int depth = 0)
     {
+        if (depth > 64)
+            return false;
         for (lxb_css_selector_list_t* l = list; l; l = l->next) {
-            if (l->first != nullptr && match_chain(l->last, el))
+            if (l->first != nullptr && match_chain(l->last, el, depth))
                 return true;
         }
         return false;
@@ -887,7 +892,7 @@ struct SelectorMatcher {
         for (uint32_t i = 0; i < len; ++i) {
             qjs::Value c(ctx, JS_GetPropertyUint32(ctx, children.raw(), i));
             if (js_is_element(ctx, c.raw()) &&
-                (match_any_list(list, c.raw()) || has_descendant_match(list, c.raw(), depth + 1)))
+                (match_any_list(list, c.raw(), depth) || has_descendant_match(list, c.raw(), depth + 1)))
                 return true;
         }
         return false;

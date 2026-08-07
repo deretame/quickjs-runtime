@@ -152,3 +152,31 @@ TEST_F(CheerioFixture, NthChildCountsElementsOnly)
     ASSERT_FALSE(r.is_exception()) << r.as<std::string>();
     EXPECT_EQ(r.as<std::string>(), "true|false|false|false|true");
 }
+
+// 安全回归：JS 构造自环对象（children=[自身]）配合 :has/:not/:is 选择器，
+// 匹配器的 depth 传递/链步数上限必须快速终止而非栈溢出或死循环。
+// 注：kMaxNodes=100000（lexbor_dom.hpp）限制 DFS；自环节点 a 的后代含 a
+// 自身（div），故 :has(div)/:is(:has(div)) 全部匹配、:not(:has(div)) 不匹配。
+TEST_F(CheerioFixture, SelfCyclePseudoNoCrash)
+{
+    Value r = ctx.eval(
+        "const a = {type:'tag', name:'div', attribs:{}, children:null};"
+        "a.children = [a];" // 自环
+        "const t0 = Date.now();"
+        "const n = __lexbor_queryAll(a, 'div:has(div)', false).length;"
+        "const n2 = __lexbor_queryAll(a, 'div:not(:has(div))', false).length;"
+        "const n3 = __lexbor_queryAll(a, 'div:is(:has(div))', false).length;"
+        // 深层嵌套 :has(:has(...)) 100 层：普通 1 节点树，深度截断快速返回
+        "const b = {type:'tag', name:'div', attribs:{}, children:[]};"
+        "const root2 = {type:'root', children:[b]};"
+        "let sel = 'div';"
+        "for (let i = 0; i < 100; i++) sel = ':has(' + sel + ')';"
+        "let n4 = -1;"
+        "try { n4 = __lexbor_queryAll(root2, sel, false).length; } catch (e) { n4 = -2; }"
+        "n + '|' + n2 + '|' + n3 + '|' + n4"
+        "+ '|' + (Date.now() - t0 < 30000);");
+    ASSERT_FALSE(r.is_exception()) << r.as<std::string>();
+    EXPECT_EQ(r.as<std::string>(), "100000|0|100000|0|true");
+}
+
+

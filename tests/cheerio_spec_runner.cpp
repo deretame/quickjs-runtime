@@ -37,14 +37,14 @@ void install_loader(Context& ctx)
             // 安全：规范化后必须仍位于 CHEERIO_TEST_DIR 内（防 .. 逃逸，
             // 兼容 / 与 \ 分隔符——JS 侧 __norm 只处理正斜杠）
             namespace fs = std::filesystem;
-            std::error_code ec;
-            fs::path base = fs::weakly_canonical(fs::path(CHEERIO_TEST_DIR), ec);
-            fs::path full = fs::weakly_canonical(fs::path(CHEERIO_TEST_DIR) / path, ec);
+            std::error_code ec1, ec2;
+            fs::path base = fs::weakly_canonical(fs::path(CHEERIO_TEST_DIR), ec1);
+            fs::path full = fs::weakly_canonical(fs::path(CHEERIO_TEST_DIR) / path, ec2);
             // 前缀带分隔符边界：full 必须等于 base，或以 base + '/' + '\\' 开头
             // （防 ../cheerio-evil/x 逃逸到 tests/ 下其它目录）
             const std::string bs = base.string();
             const std::string fs2 = full.string();
-            bool inside = !ec && (fs2 == bs ||
+            bool inside = !ec1 && !ec2 && (fs2 == bs ||
                                   (fs2.size() > bs.size() &&
                                    fs2.compare(0, bs.size(), bs) == 0 &&
                                    (fs2[bs.size()] == '/' || fs2[bs.size()] == '\\')));

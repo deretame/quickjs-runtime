@@ -34,21 +34,26 @@ inline bool try_blob_bytes(JSContext* ctx, JSValueConst v, std::string& out);
 
 struct BlobImpl {
     std::string bytes; // 合并后的原始字节
-    std::string type;  // 小写 MIME（不含参数）
+    std::string type;  // 小写 MIME（保留参数，如 multipart 的 boundary）
 
     std::size_t size() const { return bytes.size(); }
 
-    // 规范化 type：小写、去参数（';' 后）、去空白
+    // 规范化 type：参照 Node(undici) —— ASCII 小写 + 去首尾空白，保留 MIME
+    // 参数（boundary 等）。规范（File API）上 Blob.type 是解析后的 MIME type
+    // 序列化，参数必须保留——`new Blob(body, {type: 'multipart/form-data;
+    // boundary=x'})` 再经 Response 回传 formData() 依赖它（wpt formdata.any.js
+    // case-insensitive）。
     static std::string normalize_type(const std::string& t) {
-        std::string out;
-        for (const char c : t) {
-            if (c == ';')
-                break;
-            out.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
-        }
-        while (!out.empty() && (out.back() == ' ' || out.back() == '\t'))
-            out.pop_back();
-        return out;
+        std::string out = t;
+        std::transform(out.begin(), out.end(), out.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        size_t b = 0;
+        while (b < out.size() && (out[b] == ' ' || out[b] == '\t'))
+            ++b;
+        size_t e = out.size();
+        while (e > b && (out[e - 1] == ' ' || out[e - 1] == '\t'))
+            --e;
+        return out.substr(b, e - b);
     }
 
     // 追加一个 part（string / ArrayBuffer / TypedArray / DataView / Blob / File）

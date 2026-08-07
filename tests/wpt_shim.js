@@ -17,7 +17,17 @@
     'Escaping produces double-percent',
     // 参照 Node(undici) 而非浏览器：referer/cookie/origin 等 forbidden 头用户
     // 自定义后正常发送（wpt 按浏览器语义期望不发送，登记为有意偏离）
-    ' is a forbidden request header'
+    ' is a forbidden request header',
+    // request-headers.any.js：forbidden 请求头/no-cors 过滤语义同上（有意偏离，不拦截）
+    'Adding invalid request header',
+    'Adding invalid no-cors request header',
+    'Check that request constructor is filtering headers provided as init parameter',
+    'Check that no-cors request constructor is filtering headers provided as init parameter',
+    'Check that no-cors request constructor is filtering headers provided as part of request parameter',
+    // consume-empty：空 FormData 的 text() 期望空串——但规范（HTML multipart
+    // 编码）空表单序列化为 "--boundary--\r\n"（wpt 自带 FIXME 注明不确定，
+    // response-form-data.html 的 "Empty form data" 与之矛盾）；按规范行为登记
+    'Consume empty FormData '
   ];
   function isExpectedFail(name) {
     return expectedFailures.some(function (p) { return String(name).indexOf(p) !== -1; });

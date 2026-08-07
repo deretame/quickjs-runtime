@@ -124,14 +124,19 @@ inline qjs::Value consume_array_buffer(JSContext* ctx, const std::string& bytes)
     return qjs::Value(ctx, JS_NewArrayBufferCopy(
                               ctx, reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size()));
 }
+// 规范：bytes() 返回 Uint8Array（Body mixin；wpt request/response-consume 的
+// "Consume ... body as bytes"：instanceof Uint8Array + buffer 内容一致）
+inline qjs::Value consume_bytes(JSContext* ctx, const std::string& bytes) {
+    return qjs::Value(ctx, JS_NewUint8ArrayCopy(
+                               ctx, reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size()));
+}
 // 规范：blob() 返回的 Blob.type = 响应 Content-Type（小写；保留参数——
 // 浏览器实测含 boundary，`new Response(blob).formData()` 依赖它）
 inline qjs::Value consume_blob(JSContext* ctx, const std::string& bytes, const std::string& type) {
+    // 与 Blob 构造同一规范化（小写 + trim，保留 MIME 参数如 boundary）
     BlobImpl b;
     b.bytes = bytes;
-    b.type = type;
-    std::transform(b.type.begin(), b.type.end(), b.type.begin(),
-                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    b.type = BlobImpl::normalize_type(type);
     return qjs::Value(ctx, qjs::js_convert<BlobImpl>::to_js(ctx, b));
 }
 
@@ -140,6 +145,11 @@ template <class Self, class Fn>
 qjs::Value consume_impl(JSContext* ctx, Self& self, const char* what, Fn&& fn) {
     if (self.body_used)
         throw_type_error(ctx, "%s: body 已被消费", what);
+    // 规范：body 为 null（无 body）时消费直接返回空结果，不置 bodyUsed
+    //（wpt request/response-consume-empty：text/json/blob/arrayBuffer 后
+    // assert_false(bodyUsed)；有 body 的消费才置位）
+    if (!self.has_body)
+        return fn(ctx, self.body_bytes);
     self.body_used = true;
     return fn(ctx, self.body_bytes);
 }
@@ -158,6 +168,23 @@ std::string content_type_of(JSContext* ctx, const T& self) {
         }
     }
     return self.headers.get(ctx, "content-type").value_or("");
+}
+
+// Content-Type → MIME essence（';' 前部分 trim + ASCII 小写；
+// formData() 的 multipart/urlencoded 分支判断用）
+inline std::string mime_essence(const std::string& ct) {
+    const size_t semi = ct.find(';');
+    std::string s = ct.substr(0, semi);
+    size_t b = 0;
+    while (b < s.size() && (s[b] == ' ' || s[b] == '\t'))
+        ++b;
+    size_t e = s.size();
+    while (e > b && (s[e - 1] == ' ' || s[e - 1] == '\t'))
+        --e;
+    s = s.substr(b, e - b);
+    std::transform(s.begin(), s.end(), s.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return s;
 }
 
 // 解析 URL 的端口并做 blocked 检查（定义见 RequestImpl 之后；类内方法先声明）
@@ -466,16 +493,45 @@ inline void install_request(qjs::Context& ctx) {
                                -> exec::task<qjs::Value> {
                        co_return consume_impl(ctx.ctx, *self, "Request", consume_array_buffer);
                    })
+                   .method("bytes", [](qjs::Ctx ctx, qjs::This<RequestImpl> self)
+                               -> exec::task<qjs::Value> {
+                       co_return consume_impl(ctx.ctx, *self, "Request", consume_bytes);
+                   })
                    .method("formData",
                            [](qjs::Ctx ctx, qjs::This<RequestImpl> self) -> exec::task<qjs::Value> {
-                               const std::string ct =
-                                   content_type_of(ctx.ctx, *self);
+                               const std::string ct = content_type_of(ctx.ctx, *self);
+                               const std::string essence = mime_essence(ct);
+                               // 规范：essence 不是 multipart/urlencoded → TypeError
+                               if (essence != "multipart/form-data" &&
+                                   essence != "application/x-www-form-urlencoded")
+                                   throw_type_error(
+                                       ctx.ctx,
+                                       "Request: formData() 需要 multipart/form-data 或 "
+                                       "application/x-www-form-urlencoded Content-Type");
+                               const bool has_body = self->has_body;
                                co_return consume_impl(
                                    ctx.ctx, *self, "Request",
-                                   [ct](JSContext* ctx, const std::string& bytes) -> qjs::Value {
+                                   [ct, essence, has_body](JSContext* ctx,
+                                                           const std::string& bytes)
+                                       -> qjs::Value {
+                                       if (essence == "application/x-www-form-urlencoded") {
+                                           // urlencoded → FormData（字符串值；无 body 空串 → 空 FormData）
+                                           FormDataImpl fd;
+                                           for (auto& kv : UrlSearchParamsImpl::from_query(bytes).list)
+                                               fd.append_entry(std::move(kv.first),
+                                                               std::move(kv.second), "", "", false);
+                                           return qjs::Value(
+                                               ctx, qjs::js_convert<FormDataImpl>::to_js(ctx, fd));
+                                       }
+                                       // multipart：body 为 null（无 body）→ TypeError
+                                       //（fetch 规范 formData() 步骤：bodyBytes null → reject）
+                                       if (!has_body)
+                                           throw_type_error(ctx,
+                                                            "Request: multipart/form-data 需要 body");
                                        auto fd = parse_multipart(bytes, extract_boundary(ct));
                                        if (!fd) // 解析失败 → TypeError（wpt invalidCases）
-                                           throw_type_error(ctx, "Request: multipart/form-data 解析失败");
+                                           throw_type_error(ctx,
+                                                            "Request: multipart/form-data 解析失败");
                                        return qjs::Value(
                                            ctx, qjs::js_convert<FormDataImpl>::to_js(ctx, *fd));
                                    });
@@ -657,16 +713,41 @@ inline void install_response(qjs::Context& ctx) {
                                -> exec::task<qjs::Value> {
                        co_return consume_impl(ctx.ctx, *self, "Response", consume_array_buffer);
                    })
+                   .method("bytes", [](qjs::Ctx ctx, qjs::This<ResponseImpl> self)
+                               -> exec::task<qjs::Value> {
+                       co_return consume_impl(ctx.ctx, *self, "Response", consume_bytes);
+                   })
                    .method("formData",
                            [](qjs::Ctx ctx, qjs::This<ResponseImpl> self) -> exec::task<qjs::Value> {
-                               const std::string ct =
-                                   content_type_of(ctx.ctx, *self);
+                               const std::string ct = content_type_of(ctx.ctx, *self);
+                               const std::string essence = mime_essence(ct);
+                               if (essence != "multipart/form-data" &&
+                                   essence != "application/x-www-form-urlencoded")
+                                   throw_type_error(
+                                       ctx.ctx,
+                                       "Response: formData() 需要 multipart/form-data 或 "
+                                       "application/x-www-form-urlencoded Content-Type");
+                               const bool has_body = self->has_body;
                                co_return consume_impl(
                                    ctx.ctx, *self, "Response",
-                                   [ct](JSContext* ctx, const std::string& bytes) -> qjs::Value {
+                                   [ct, essence, has_body](JSContext* ctx,
+                                                           const std::string& bytes)
+                                       -> qjs::Value {
+                                       if (essence == "application/x-www-form-urlencoded") {
+                                           FormDataImpl fd;
+                                           for (auto& kv : UrlSearchParamsImpl::from_query(bytes).list)
+                                               fd.append_entry(std::move(kv.first),
+                                                               std::move(kv.second), "", "", false);
+                                           return qjs::Value(
+                                               ctx, qjs::js_convert<FormDataImpl>::to_js(ctx, fd));
+                                       }
+                                       if (!has_body)
+                                           throw_type_error(
+                                               ctx, "Response: multipart/form-data 需要 body");
                                        auto fd = parse_multipart(bytes, extract_boundary(ct));
                                        if (!fd) // 解析失败 → TypeError（wpt invalidCases）
-                                           throw_type_error(ctx, "Response: multipart/form-data 解析失败");
+                                           throw_type_error(
+                                               ctx, "Response: multipart/form-data 解析失败");
                                        return qjs::Value(
                                            ctx, qjs::js_convert<FormDataImpl>::to_js(ctx, *fd));
                                    });

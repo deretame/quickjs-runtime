@@ -158,8 +158,13 @@ inline std::string encode_multipart(const FormDataImpl& fd, const std::string& b
 
 // multipart/form-data 解析（fetch 规范 §multipart/form-data parsing；头名大小写不敏感）
 inline std::string extract_boundary(const std::string& content_type) {
+    // 参数名大小写不敏感（MIME 语义）：用小写副本定位；boundary 值本身
+    // 大小写敏感，从原文截取
+    std::string lower = content_type;
+    std::transform(lower.begin(), lower.end(), lower.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     const std::string key = "boundary=";
-    const size_t p = content_type.find(key);
+    const size_t p = lower.find(key);
     if (p == std::string::npos)
         return "";
     size_t b = p + key.size();
@@ -203,6 +208,10 @@ inline std::optional<FormDataImpl> parse_multipart(const std::string& body,
                                                    const std::string& boundary) {
     if (boundary.empty())
         return std::nullopt;
+    // HTML 标准 multipart/form-data parsing：bytes 为空字节序列 → 返回空 entry list
+    //（空 FormData 序列化为空 body 后 formData() 应得空 FormData；wpt formdata.any.js）
+    if (body.empty())
+        return FormDataImpl{};
     FormDataImpl fd;
     const std::string delim = "--" + boundary;
     // transport padding（RFC 2046）：delimiter 后允许若干 tab/space

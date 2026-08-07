@@ -401,7 +401,8 @@ TEST_F(FetchFixture, BlobBasic)
         " {type: 'text/PLAIN;charset=utf-8'});"
         "b.size + '|' + b.type;");
     ASSERT_FALSE(r.is_exception());
-    EXPECT_EQ(r.as<std::string>(), "9|text/plain");
+    // 规范：Blob.type 保留 MIME 参数（参照 Node：小写 + trim，保留原始空白）
+    EXPECT_EQ(r.as<std::string>(), "9|text/plain;charset=utf-8");
     r = ctx.eval(
         "var b = new Blob(['abcdef']);"
         "b.slice(1, 4).text().then(t => { globalThis.__sl = t; });"
@@ -592,6 +593,146 @@ TEST_F(FetchFixture, P0AbortSignalTimeoutAny)
         "AbortSignal.any([c.signal]).aborted;");
     ASSERT_FALSE(r.is_exception());
     EXPECT_EQ(r.as<std::string>(), "true");
+}
+
+// ---- 空 body 消费：bodyUsed 不置位；有 body 消费才置位（wpt consume-empty） ----
+TEST_F(FetchFixture, ConsumeEmptyBodyBodyUsed)
+{
+    // 无 body：text()/arrayBuffer() 返回空结果且 bodyUsed 保持 false
+    Value r = ctx.eval(
+        "var req = new Request('http://x/', {method: 'POST'});"
+        "var resp = new Response();"
+        "globalThis.__cb = 'pending';"
+        "Promise.all([req.text(), resp.text(), req.arrayBuffer(), resp.arrayBuffer(),"
+        "             resp.json().catch(() => 'jerr'), req.json().catch(() => 'jerr')])"
+        ".then(v => { globalThis.__cb ="
+        "  (v[0] === '' && v[1] === '' && v[2].byteLength === 0 && v[3].byteLength === 0 &&"
+        "   v[4] === 'jerr' && v[5] === 'jerr') + '|' + req.bodyUsed + '|' + resp.bodyUsed; });"
+        "'ok'");
+    ASSERT_FALSE(r.is_exception());
+    rt.run_to_completion();
+    EXPECT_EQ(ctx.eval("__cb").as<std::string>(), "true|false|false");
+    // 有 body：消费后 bodyUsed 置位
+    r = ctx.eval(
+        "var req2 = new Request('http://x/', {method: 'POST', body: 'hi'});"
+        "req2.text().then(() => { globalThis.__cb2 = req2.bodyUsed; }); 'ok'");
+    ASSERT_FALSE(r.is_exception());
+    rt.run_to_completion();
+    EXPECT_EQ(ctx.eval("__cb2").as<std::string>(), "true");
+    // 重复消费 → rejected promise（fetch 规范：text() 对已消费 body reject TypeError，非同步抛）
+    r = ctx.eval(
+        "var resp2 = new Response('x');"
+        "resp2.text().then(() => {"
+        "  resp2.text().then(() => { globalThis.__cb3 = 'no-reject'; },"
+        "    e => { globalThis.__cb3 = e.name; });"
+        "}); 'ok'");
+    ASSERT_FALSE(r.is_exception());
+    rt.run_to_completion();
+    EXPECT_EQ(ctx.eval("__cb3").as<std::string>(), "TypeError");
+}
+
+// ---- bytes()：返回 Uint8Array，内容一致，bodyUsed 置位 ----
+TEST_F(FetchFixture, BodyBytes)
+{
+    Value r = ctx.eval(
+        "var resp = new Response('hi');"
+        "resp.bytes().then(u8 => {"
+        "  globalThis.__by = (u8 instanceof Uint8Array) + '|' + u8.length + '|' +"
+        "    new TextDecoder().decode(u8) + '|' + resp.bodyUsed;"
+        "}); 'ok'");
+    ASSERT_FALSE(r.is_exception());
+    rt.run_to_completion();
+    EXPECT_EQ(ctx.eval("__by").as<std::string>(), "true|2|hi|true");
+    // 空 body bytes() → 空 Uint8Array
+    r = ctx.eval(
+        "new Response().bytes().then(u8 => { globalThis.__by2 = u8.length; }); 'ok'");
+    ASSERT_FALSE(r.is_exception());
+    rt.run_to_completion();
+    EXPECT_EQ(ctx.eval("__by2").as<int>(), 0);
+}
+
+// ---- formData()：urlencoded 分支 + 无 body 语义（wpt consume-empty/request-consume） ----
+TEST_F(FetchFixture, FormDataUrlencoded)
+{
+    Value r = ctx.eval(
+        "var resp = new Response('a=1&b=hello+world&empty=');"
+        "resp.headers.set('content-type', 'application/x-www-form-urlencoded;charset=UTF-8');"
+        "resp.formData().then(fd => {"
+        "  globalThis.__fd = fd.get('a') + '|' + fd.get('b') + '|' + fd.get('empty');"
+        "}); 'ok'");
+    ASSERT_FALSE(r.is_exception());
+    rt.run_to_completion();
+    EXPECT_EQ(ctx.eval("__fd").as<std::string>(), "1|hello world|");
+    // 无 body + urlencoded content-type → 空 FormData（成功，bodyUsed 不置位）
+    r = ctx.eval(
+        "var req = new Request('http://x/', {method: 'POST',"
+        "  headers: [['Content-Type', 'application/x-www-form-urlencoded;charset=UTF-8']]});"
+        "req.formData().then(fd => {"
+        "  globalThis.__fd2 = (fd instanceof FormData) + '|' + fd.get('nope') + '|' + req.bodyUsed;"
+        "}); 'ok'");
+    ASSERT_FALSE(r.is_exception());
+    rt.run_to_completion();
+    EXPECT_EQ(ctx.eval("__fd2").as<std::string>(), "true|null|false");
+    // 无 body + multipart content-type → TypeError（fetch 规范：bodyBytes null）
+    r = ctx.eval(
+        "var req2 = new Request('http://x/', {method: 'POST',"
+        "  headers: [['Content-Type', 'multipart/form-data; boundary=\"boundary\"']]});"
+        "req2.formData().then(() => { globalThis.__fd3 = 'ok'; },"
+        "  e => { globalThis.__fd3 = e.name + '|' + req2.bodyUsed; }); 'ok'");
+    ASSERT_FALSE(r.is_exception());
+    rt.run_to_completion();
+    EXPECT_EQ(ctx.eval("__fd3").as<std::string>(), "TypeError|false");
+    // 无 body + 无 content-type → TypeError
+    r = ctx.eval(
+        "new Response().formData().then(() => { globalThis.__fd4 = 'ok'; },"
+        "  e => { globalThis.__fd4 = e.name; }); 'ok'");
+    ASSERT_FALSE(r.is_exception());
+    rt.run_to_completion();
+    EXPECT_EQ(ctx.eval("__fd4").as<std::string>(), "TypeError");
+}
+
+// ---- Blob.type 保留 MIME 参数 + multipart 全链路大小写不敏感（wpt formdata.any.js） ----
+TEST_F(FetchFixture, BlobTypeKeepsParamsAndMultipartCaseInsensitive)
+{
+    // Blob 构造：type 保留参数（boundary），仅小写 + trim（参照 Node）
+    Value r = ctx.eval(
+        "var b = new Blob(['x'], {type: 'Multipart/Form-Data ;  boundary=\"AbC\"'});"
+        "b.type;");
+    ASSERT_FALSE(r.is_exception());
+    EXPECT_EQ(r.as<std::string>(), "multipart/form-data ;  boundary=\"abc\"");
+    // wpt formdata.any.js：multipart body 小写化后仍可解析回 FormData
+    r = ctx.eval(R"JS(
+(async () => {
+  let formdata = new FormData();
+  formdata.append('foo', new Blob([JSON.stringify({ bar: "baz" })], { type: "application/json" }));
+  let blob = await new Response(formdata).blob();
+  let body = await blob.text();
+  blob = new Blob([body.toLowerCase()], { type: blob.type.toLowerCase() });
+  let fd = await new Response(blob).formData();
+  globalThis.__mci = fd.has('foo') + '|' + fd.get('foo').type;
+})()
+)JS");
+    ASSERT_FALSE(r.is_exception());
+    rt.run_to_completion();
+    EXPECT_EQ(ctx.eval("__mci").as<std::string>(), "true|application/json");
+    // 空 FormData：text() 输出 "--boundary--" 格式（HTML multipart 编码，wpt
+    // response-form-data.html "Empty form data"）；formData() 解析回空表单
+    r = ctx.eval(R"JS(
+(async () => {
+  const r1 = new Response(new FormData());
+  const t = await r1.text();
+  const start = t.startsWith('--');
+  let boundary = t.substring(2).trim();
+  const end = boundary.endsWith('--');
+  const r2 = new Response(t);
+  r2.headers.set('content-type', 'multipart/form-data; boundary=' + boundary.substring(0, boundary.length - 2));
+  const fd = await r2.formData();
+  globalThis.__efd = start + '|' + end + '|' + (fd instanceof FormData) + '|' + fd.get('x');
+})()
+)JS");
+    ASSERT_FALSE(r.is_exception());
+    rt.run_to_completion();
+    EXPECT_EQ(ctx.eval("__efd").as<std::string>(), "true|true|true|null");
 }
 
 } // namespace

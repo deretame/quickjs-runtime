@@ -238,6 +238,24 @@ TEST_F(FetchFixture, RequestNonAsciiUrl)
     EXPECT_EQ(r.as<std::string>(), "http://x/y?z=1%7Cx|before-ß-after");
 }
 
+// 参照 Node(undici)：referer/cookie/origin 等用户自定义头可正常存储与发送
+//（不做浏览器式 forbidden 过滤）；host/content-length 由运行时管理（忽略）。
+TEST_F(FetchFixture, RequestRefererCustomHeader)
+{
+    Value r = ctx.eval(
+        "var req = new Request('http://x/', {headers: {"
+        "  'Referer': 'http://example.com/ref', 'Cookie': 'a=b',"
+        "  'Origin': 'http://custom-origin.com', 'Host': 'evil.com',"
+        "  'Content-Length': '999'"
+        "}});"
+        "['referer','cookie','origin','host','content-length'].map("
+        "  n => req.headers.get(n)).join('|');");
+    ASSERT_FALSE(r.is_exception());
+    // 存储层不检查（Node Headers 语义）；host/content-length 在发送层忽略
+    EXPECT_EQ(r.as<std::string>(),
+              "http://example.com/ref|a=b|http://custom-origin.com|evil.com|999");
+}
+
 TEST_F(FetchFixture, RequestSurrogateUrl)
 {
     ctx.eval("location = {href: 'http://x/url-encoding.html'}");

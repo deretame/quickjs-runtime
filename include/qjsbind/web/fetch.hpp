@@ -387,7 +387,10 @@ inline void install_fetch(qjs::Context& ctx, std::shared_ptr<FetchBackend> backe
                       // headers_from 在 guard 置位前可能已存入了 forbidden 头/值）
                       std::vector<Header> hdrs;
                       for (const auto& [k, v] : req.headers.list) {
-                          if (qjsbind::web::is_forbidden_request_header(k))
+                          // Node(undici) 行为：referer/cookie/origin 等用户自定义头
+                          // 正常发送（不做 forbidden 过滤）；host/content-length 由
+                          // 运行时管理（用户设置被忽略，避免与连接/长度语义冲突）
+                          if (k == "host" || k == "content-length")
                               continue;
                           if (qjsbind::web::is_method_override_header(k)) {
                               // 值含 forbidden method（逗号分列 + trim + 小写匹配）→ 不发

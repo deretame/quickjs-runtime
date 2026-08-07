@@ -284,11 +284,12 @@ untime/third_party/...`，errno=22）→ 用 `std::fopen`
 "` + 解析端防御 strip
 - **状态**：已规避（wpt_runner/analyze_wpt.py/http_client 均含规避代码）。
 
-### KI-055 ○ wpt 精选子集 6 个 expected（v1 已知限制）
+### KI-055 ○ wpt 精选子集 28 个 expected（v1 已知限制）
 - 裸 `%` 在 query 的 WHATWG 保留语义（boost 无法表示）：1 个
 - Request/Response 的 `blob()` 未实现（body 消费仅 text/json/arrayBuffer/formData）：4 个
 - Headers 实例构造走内部拷贝（不走自定义迭代器）：1 个
-- **状态**：设计规避（shim 内登记 expected，套件保持 0 fail）。
+- forbidden 请求头：参照 Node(undici) 而非浏览器，referer/cookie/origin 等用户自定义头正常发送（wpt 按浏览器语义期望不发送）：22 个
+- **状态**：设计偏离（Node 行为）或设计规避（shim 内登记 expected，套件保持 0 fail）。
 - **历史**：活迭代器、`data:` URL fetch、Blob/FormData、integrity、URLSearchParams 双向联动均已实现，从 expected 移除。
 
 ### KI-056 ★ parse_multipart 死循环：跳过畸形 part 时位置未推进

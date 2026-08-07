@@ -23,20 +23,6 @@
 
 namespace qjsbind::web {
 
-// fetch 规范 forbidden request-header name（request / request-no-cors guard）
-inline bool is_forbidden_request_header(const std::string& lower_name) {
-    static const char* const kForbidden[] = {
-        "accept-charset", "accept-encoding", "access-control-request-headers",
-        "access-control-request-method", "connection", "content-length", "cookie",
-        "cookie2", "date", "dnt", "expect", "host", "keep-alive", "origin", "referer",
-        "te", "trailer", "transfer-encoding", "upgrade", "via",
-    };
-    for (const auto* f : kForbidden)
-        if (lower_name == f)
-            return true;
-    return lower_name.starts_with("proxy-") || lower_name.starts_with("sec-");
-}
-
 // method-override 头（值含 forbidden method 时整体忽略，见 forbidden()）
 inline bool is_method_override_header(const std::string& lower_name) {
     return lower_name == "x-http-method-override" || lower_name == "x-http-method" ||
@@ -122,13 +108,13 @@ struct HeadersImpl {
         return value;
     }
 
-    // fetch 规范：guard=request/request-no-cors/response 下，append/set/delete
-    // 对 forbidden 头静默忽略（不存储、不抛错）；get/has 不检查 guard。
+    // fetch 规范：guard=request 下 append/set/delete 对 forbidden 头静默忽略。
+    // 本项目参照 Node(undici)：不检查 forbidden（referer/cookie/origin 等用户
+    // 自定义头正常存储与发送），仅发送层（fetch.hpp）过滤 host/content-length
+    // 两个由运行时管理的头，避免协议冲突。
     // method-override 头（x-http-method 等）的值按逗号分列、trim、小写后
-    // 任一项是 forbidden method（trace/track/connect）→ 同样忽略。
+    // 任一项是 forbidden method（trace/track/connect）→ 同样忽略（安全特性）。
     bool forbidden(JSContext* ctx, const std::string& lower_name, const std::string& value) const {
-        if (guard == Guard::Request && is_forbidden_request_header(lower_name))
-            return true;
         if (guard == Guard::Request && is_method_override_header(lower_name)) {
             std::string part;
             auto check_part = [&] {

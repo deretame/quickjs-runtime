@@ -24,8 +24,8 @@ JS (quickjs-ng) ── qjsbind 绑定层 ── qjsbind::web（header-only）
 
 | 类 | 成员 | 备注 |
 |---|---|---|
-| fetch | `fetch(input, init)` | redirect follow≤20/error/manual；响应 type="basic"；forbidden 请求头过滤；blocked port |
-| Headers | 构造（record/序列/实例/undefined/null→TypeError）、append/set/delete/get/has/forEach/entries/keys/values/getSetCookie、Symbol.iterator | guard：none/request/request-no-cors/response/immutable；forbidden 静默忽略（immutable 抛）；同名多值存储（set-cookie 语义）；迭代 sort+combine；活迭代器（迭代中增删反映，读内部 list） |
+| fetch | `fetch(input, init)` | redirect follow≤20/error/manual；响应 type="basic"；参照 Node(undici)：用户自定义头（referer/cookie/origin 等）正常发送，仅 host/content-length 由运行时管理；blocked port |
+| Headers | 构造（record/序列/实例/undefined/null→TypeError）、append/set/delete/get/has/forEach/entries/keys/values/getSetCookie、Symbol.iterator | guard：none/request/request-no-cors/response/immutable；参照 Node：guard=request 不检查 forbidden（referer/cookie 等可存可取）；immutable 抛；同名多值存储（set-cookie 语义）；迭代 sort+combine；活迭代器（迭代中增删反映，读内部 list） |
 | Request | method/url/headers/redirect/signal/body/bodyUsed、clone、text/json/arrayBuffer/formData | body：string/ArrayBuffer/TypedArray/DataView/URLSearchParams/Blob/File/FormData/Request/Response 实例、其他值 ToString；method 规范化；GET/HEAD 禁 body；integrity：sha256/384/512 校验；blob() 未实现 |
 | Response | status/statusText/type/url/redirected/ok/headers/body/bodyUsed、text/json/arrayBuffer/formData、clone、error()、redirect() | 204/205/304 无 body（带 body 抛 TypeError）；status 非法 RangeError；statusText ByteString 检查；error() 的 headers guard=immutable；formData() 走 multipart 解析；blob() 未实现 |
 | URL | 各属性、searchParams、toString/href、静态 parse 未实现 | boost::urls；相对解析带 base；宽松解析（非 ASCII/`|`/裸 `%` → WHATWG 编码重试）；UTF-16 转换（孤立代理→U+FFFD）；searchParams 双向联动（SameObject 缓存 + 回写） |
@@ -60,9 +60,10 @@ python scripts/analyze_wpt.py
 cd build && ./quickjs_runtime_tests.exe --gtest_filter="WptRunner.*"
 ```
 
-## 5. 已知限制（v1，6 个 expected + 清单 skip）
+## 5. 已知限制（v1，28 个 expected + 清单 skip）
 
 - **裸 `%`**：query 中 WHATWG 保留裸 `%`，boost 严格语法无法表示（1 个 expected）
 - **`blob()`**：Request/Response 的 blob() 未实现（4 个 expected；body 消费仅 text/json/arrayBuffer/formData）
+- **forbidden 请求头**：参照 Node(undici) 而非浏览器——referer/cookie/origin 等用户自定义头正常发送（22 个 expected；wpt 按浏览器语义期望不发送）
 - 清单级 skip：`.sub` 模板、`.https`、worker、credentials/cors/policies 目录、ReadableStream/MediaSource 等未实现 API、Request cache/keepalive/priority 等未实现字段、beast 严格解析拒绝的重复 content-length/控制字符头值（header-value-combining）
 - **未实现**：Request/Response 的 body 流（ReadableStream）、blob()、CORS 与跨域、credentials/cookie、cache/keepalive、URL 静态 parse

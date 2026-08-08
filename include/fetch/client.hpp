@@ -178,7 +178,7 @@ private:
 
 inline std_exec::task<Response> Client::fetch_once(const Request& req, std::stop_token st)
 {
-    check_url_ports(req.url); // 公开 API 也检查（security review LOW：防 C++ 调用方绕过）
+    check_url_ports(req.url); // 纵深防御（fetch() 循环已检查；防未来新增调用方绕过）
     Handler h = make_chain(mws_, transport_);
     if (opt_.auto_decompress) {
         auto ae =

@@ -69,10 +69,12 @@ struct ScopeJoiner {
 // 结果（done/stopped/error）存成员，主线程断言。
 struct Probe {
     boost::asio::io_context io;
-    fetch::Client client{io};
+    fetch::Client client;
     bool done = false;
     bool stopped = false;
     std::exception_ptr error;
+
+    explicit Probe(fetch::Options opt = {}) : client{io, std::move(opt)} {}
 
     void run(std_exec::task<void> work)
     {
@@ -414,6 +416,32 @@ TEST(FetchcoreDirect, DecompressTotalLimit)
             fetch::DecompressSource::Kind::Deflate);
         std::string got = co_await read_all_src(*dec2); // 先读干再断言
         EXPECT_EQ(got, raw);
+    }());
+    ASSERT_TRUE(p.done);
+    ASSERT_FALSE(p.error) << p.error_message();
+}
+
+// Options.max_decompressed_bytes → AcceptEncodingMiddleware 接线（review
+// sa_20260808_175039 nit 2）：低上限 + 大 gzip 响应 → read 抛异常
+TEST(FetchcoreDirect, DecompressOptionsLimit)
+{
+    wpt::WptTestServer server("third_party/wpt");
+    fetch::Options opt;
+    opt.max_decompressed_bytes = 1024; // 极小上限（默认 256 MiB）
+    Probe p(opt);
+    p.run([&]() -> std_exec::task<void> {
+        fetch::Request req;
+        req.method = "POST";
+        req.url = server.base_url() + "/compress.py?code=gzip";
+        req.body = std::string(64 * 1024, 'x'); // 解压后远超上限
+        fetch::Response resp = co_await p.client.fetch(std::move(req));
+        bool threw = false;
+        try {
+            (void)co_await fetch::read_all(resp);
+        } catch (const std::runtime_error&) {
+            threw = true;
+        }
+        EXPECT_TRUE(threw);
     }());
     ASSERT_TRUE(p.done);
     ASSERT_FALSE(p.error) << p.error_message();

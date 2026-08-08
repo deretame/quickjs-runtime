@@ -6,6 +6,15 @@ import pathlib
 import sys
 
 FILES = [
+    "include/fetch/beast_transport.hpp",
+    "include/fetch/body.hpp",
+    "include/fetch/client.hpp",
+    "include/fetch/error.hpp",
+    "include/fetch/middleware.hpp",
+    "include/fetch/scheduler.hpp",
+    "include/fetch/task.hpp",
+    "include/fetch/transport.hpp",
+    "include/fetch/types.hpp",
     "include/qjsbind/rt_value.hpp",
     "include/qjsbind/web/abort.hpp",
     "include/qjsbind/web/dom_exception.hpp",
@@ -20,6 +29,7 @@ FILES = [
     "src/fetch/beast_transport.cpp",
     "src/fetch/socks5.cpp",
     "tests/fetch_test.cpp",
+    "tests/fetchcore_test.cpp",
 ]
 
 BOM = b"\xef\xbb\xbf"

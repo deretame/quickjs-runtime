@@ -312,12 +312,6 @@ TEST(FetchcoreDirect, Integrity)
         bad.integrity = "sha384-" + std::string(64, 'A');
         fetch::Response resp2 = co_await p.client.fetch(std::move(bad));
         out += "|" + co_await fetch::read_all(resp2); // 应抛
-        // 204 null body + integrity：头前立即抛 fetch::Error
-        fetch::Request nullb;
-        nullb.url = server.base_url() + "/status.py?code=204";
-        nullb.integrity = "sha384-UT6f7WCFp32YJnp1is4l/ZYnOeQKpE8xjmdkLOwZ3nIP+tmT2aMRFQGJomjVf5cE";
-        fetch::Response resp3 = co_await p.client.fetch(std::move(nullb));
-        (void)resp3;
     }());
     ASSERT_TRUE(p.done);
     // 错误摘要的 read_all 抛 runtime_error（SRI 不匹配）——通过 error 通道捕获
@@ -326,6 +320,24 @@ TEST(FetchcoreDirect, Integrity)
     // "|" 未拼接——out 停在第一个成功读取的 "hello world"
     EXPECT_EQ(out, "hello world");
     EXPECT_EQ(p.error_message(), "integrity: 摘要不匹配（SRI 校验失败）");
+}
+
+// 204 null body + integrity：fetch 阶段立即抛 fetch::Error（null body 无法校验）
+// ——与错误摘要用例拆开（协程异常后后续不可达，review nit 1）
+TEST(FetchcoreDirect, IntegrityNullBody)
+{
+    wpt::WptTestServer server("third_party/wpt");
+    Probe p;
+    p.run([&]() -> std_exec::task<void> {
+        fetch::Request nullb;
+        nullb.url = server.base_url() + "/status.py?code=204";
+        nullb.integrity = "sha384-UT6f7WCFp32YJnp1is4l/ZYnOeQKpE8xjmdkLOwZ3nIP+tmT2aMRFQGJomjVf5cE";
+        fetch::Response resp3 = co_await p.client.fetch(std::move(nullb));
+        (void)resp3;
+    }());
+    ASSERT_TRUE(p.done);
+    ASSERT_TRUE(p.error) << "204 + integrity 应抛 fetch::Error";
+    EXPECT_EQ(p.error_message(), "fetch: integrity 无法校验 null body 响应");
 }
 
 // ---- data: URL 本地构造 ----

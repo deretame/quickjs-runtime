@@ -38,16 +38,32 @@ namespace fetch {
 // 与绑定层 UrlImpl::parse 对齐：boost 严格语法拒绝的字符（非 ASCII、
 // 裸 % 等 WHATWG 允许的）→ 宽松 percent-encode 重试（wpt
 // redirect-location-escape 覆盖原始 UTF-8 字节的 Location）；
-// scheme 小写化（HTTP:// 等大写 scheme 在 WHATWG 解析器下归一为小写，
-// 否则下一跳传输层的 "http" 比较会拒绝——review should-fix）。
+// scheme/host 小写化 + 默认端口剥离（WHATWG 归一；否则大写 host 或
+// 显式 :80/:443 的 Location 会破坏 resp.url 一致性——review should-fix）。
 inline std::string resolve_url(const std::string& loc, const std::string& base)
 {
-    auto normalize_scheme = [](boost::urls::url& u) {
+    auto normalize_url = [](boost::urls::url& u) {
+        // scheme 小写化（HTTP:// → http://）
         if (u.has_scheme() && !u.scheme().empty()) {
             std::string s(u.scheme());
             for (auto& c : s)
                 c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
             u.set_scheme(s);
+        }
+        // host 小写化：IPv6 文字地址（含冒号/方括号）跳过；set_host 失败忽略
+        //（host 来自 boost 语法解析，理论不会失败）
+        std::string host(u.host());
+        if (!host.empty() && host.find(':') == std::string::npos) {
+            for (auto& c : host)
+                c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            (void)u.set_host(host);
+        }
+        // 默认端口剥离（http:80 / https:443）
+        if (u.has_port()) {
+            const bool is_https = u.scheme() == "https";
+            const std::string p(u.port());
+            if ((!is_https && p == "80") || (is_https && p == "443"))
+                u.remove_port();
         }
     };
 
@@ -96,7 +112,7 @@ inline std::string resolve_url(const std::string& loc, const std::string& base)
     }
     if ((*r).has_scheme()) {
         boost::urls::url u(*r);
-        normalize_scheme(u);
+        normalize_url(u);
         return std::string(u.buffer());
     }
     auto rb = boost::urls::parse_uri_reference(base);
@@ -110,7 +126,7 @@ inline std::string resolve_url(const std::string& loc, const std::string& base)
     auto res = u.resolve(*r); // 原地解析（boost 1.91：返回 result<void> 仅作错误检查）
     if (res.has_error())
         throw Error("fetch: 相对解析失败");
-    normalize_scheme(u);
+    normalize_url(u);
     return std::string(u.buffer());
 }
 
@@ -206,7 +222,7 @@ inline std_exec::task<Response> Client::fetch(Request req, std::stop_token st)
         if (req.redirect == Request::Redirect::follow && is_redirect_status(resp.status) &&
             !loc.empty()) {
             if (hop == kMaxRedirects)
-                throw Error("fetch: 重定向次数超过 20");
+                throw Error("fetch: 重定向次数超过 " + std::to_string(kMaxRedirects));
             url = resolve_url(loc, url); // 相对 Location 以当前 URL 为 base 解析
             // 303 一律转 GET；301/302 仅 POST 转 GET
             if (status_requires_get(resp.status, method)) {
@@ -229,7 +245,7 @@ inline std_exec::task<Response> Client::fetch(Request req, std::stop_token st)
         resp.redirected = hop > 0;  // 规范：经重定向的响应 redirected=true
         co_return resp;
     }
-    throw Error("fetch: 重定向次数超过 20");
+    throw Error("fetch: 重定向次数超过 " + std::to_string(kMaxRedirects));
 }
 
 } // namespace fetch

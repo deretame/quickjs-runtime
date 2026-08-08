@@ -84,6 +84,9 @@ add_executable(quickjs_runtime_tests
     tests/wpt_runner.cpp
     tests/socks5_test.cpp
     tests/cheerio_test.cpp
+    tests/cheerio_bench_test.cpp
+    tests/cheerio_fast_test.cpp
+    tests/min_fast_tmp.cpp
     tests/cheerio_spec_runner.cpp
     tests/mini_task_test.cpp
 )

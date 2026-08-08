@@ -5,7 +5,7 @@
 // globalThis.__cheerio_tests。本测试不要求全绿：统计通过/失败并打印失败
 // 明细，用于迭代提升兼容性。
 #include <gtest/gtest.h>
-#include <qjsbind/cheerio/cheerio.hpp>
+#include <qjsbind/cheerio/lexbor_api.hpp>
 #include <qjsbind/qjsbind.hpp>
 
 #include <fstream>
@@ -144,9 +144,15 @@ SpecResult run_spec(Context& ctx, const std::string& spec)
     JS_ToInt32(ctx.raw(), &f, fail.raw());
     out.pass = p;
     out.fail = f;
-    qjs::Value list = ctx.eval(
-        "globalThis.__cheerio_tests.failures.map("
-        "f => 'FAIL: ' + f.name + '  --  ' + f.message).join('\\n')");
+    const char* diag_stack = getenv("CHEERIO_DIAG_STACK");
+    std::string js = std::string("globalThis.__cheerio_tests.failures.map("
+                                 "f => 'FAIL: ' + f.name + '  --  ' + f.message +") +
+                     (diag_stack ? std::string(" (f.stack ? '\\n      @ ' + "
+                                               "f.stack.split('\\n').slice(0,4)."
+                                               "join('\\n      @ ') : '')")
+                                 : std::string(" ''")) +
+                     std::string(").join('\\n')");
+    qjs::Value list = ctx.eval(js);
     if (list.is_string()) {
         std::string all = list.as<std::string>();
         size_t pos = 0;
@@ -168,9 +174,11 @@ TEST(CheerioSpec, OfficialSuite)
     setvbuf(stdout, nullptr, _IONBF, 0); // 崩溃时统计不丢（stdout 无缓冲）
     Runtime rt;
     Context ctx = rt.main_context();
-    ASSERT_TRUE(qjsbind::cheerio::install_cheerio(ctx));
+    qjsbind::cheerio::lxb_handle::install_cheerio_fast(ctx);
     install_loader(ctx);
 
+    // 支持 CHEERIO_SPEC_FILTER 环境变量：只跑包含该子串的 spec（调试用）
+    const char* filter = getenv("CHEERIO_SPEC_FILTER");
     const std::vector<std::string> specs = {
         "cheerio.spec.js",
         "load.spec.js",
@@ -189,17 +197,23 @@ TEST(CheerioSpec, OfficialSuite)
 
     int total_pass = 0, total_fail = 0;
     for (const auto& spec : specs) {
+        if (filter && spec.find(filter) == std::string::npos)
+            continue;
         // 每个 spec 独立 Runtime：避免跨 spec 的 JS 对象积累（GC 压力）
         // 引发偶发崩溃，也隔离 spec 间的全局污染。
         Runtime spec_rt;
         Context spec_ctx = spec_rt.main_context();
-        if (!qjsbind::cheerio::install_cheerio(spec_ctx)) {
-            std::printf("[cheerio-spec] %-28s install failed\n", spec.c_str());
-            total_fail += 1000;
-            continue;
-        }
+        qjsbind::cheerio::lxb_handle::install_cheerio_fast(spec_ctx);
         install_loader(spec_ctx);
-        SpecResult res = run_spec(spec_ctx, spec);
+        if (const char* itf = getenv("CHEERIO_IT_FILTER"))
+            spec_ctx.eval("globalThis.__it_filter = '" + std::string(itf) + "'; 1");
+        if (const char* itl = getenv("CHEERIO_IT_LIMIT"))
+            spec_ctx.eval("globalThis.__it_limit = " + std::string(itl) + "; 1");
+        SpecResult res;
+        if (getenv("CHEERIO_SKIP_SPEC"))
+            res = SpecResult{};
+        else
+            res = run_spec(spec_ctx, spec);
         total_pass += res.pass;
         total_fail += res.fail;
         qjs::Value lastv = spec_ctx.eval("globalThis.__cheerio_tests.last || ''");

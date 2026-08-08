@@ -22,6 +22,7 @@
 #include <stdexcept>
 #include <tuple>
 
+#include <algorithm>
 #include <cctype>
 #include <cstring>
 

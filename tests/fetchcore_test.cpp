@@ -71,7 +71,6 @@ struct Probe {
     fetch::Client client{io};
     bool done = false;
     bool stopped = false;
-    bool joined = false; // scope join 是否在超时前完成（慢机/死锁可见）
     std::exception_ptr error;
 
     void run(std_exec::task<void> work)
@@ -91,8 +90,9 @@ struct Probe {
             scope.get_token(),
             stdexec::prop{stdexec::get_start_scheduler, fetch::io_scheduler{io}});
         // counting_scope 析构要求 state 为 joined——必须 close + join
-        // （见 stdexec [exec.simple.counting]；仅 spawn 不 join 会 terminate）
-        joined = ScopeJoiner::run(scope, io);
+        // （见 stdexec [exec.simple.counting]；仅 spawn 不 join 会 terminate）。
+        // 超时由 ScopeJoiner 告警 + 调用方 done 断言（协程未完成）覆盖。
+        (void)ScopeJoiner::run(scope, io);
     }
 
     std::string error_message() const

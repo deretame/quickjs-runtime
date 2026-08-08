@@ -49,7 +49,9 @@ inline std::string resolve_url(const std::string& loc, const std::string& base)
                 c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
             u.set_scheme(s);
         }
-    };    auto relax = [](std::string_view url) {
+    };
+
+    auto relax = [](std::string_view url) {
         size_t auth_end = 0;
         const size_t scheme_end = url.find("://");
         if (scheme_end != std::string_view::npos) {

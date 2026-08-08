@@ -431,8 +431,10 @@ inline JSValue sel_call_ex(JSContext* ctx, JSValueConst func_obj,
         return make_sel(ctx, s->ref, std::move(nodes));
     }
     // $(nodeHandle)：包装单节点
-    if (NodeHandle* h = unwrap_node(ctx, argv[0])) {
-        return make_sel(ctx, h->ref, {h->node});
+    if (argc >= 1) {
+        if (NodeHandle* h = unwrap_node(ctx, argv[0])) {
+            return make_sel(ctx, h->ref, {h->node});
+        }
     }
     // $(array of handles)：包装
     if (argc >= 1 && JS_IsArray(argv[0])) {

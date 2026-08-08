@@ -232,6 +232,12 @@ TEST(FetchcoreDirect, ResolveUrlNormalization)
     // IPv6 文字地址：host 跳过小写化、不抛异常
     EXPECT_EQ(fetch::resolve_url("http://[::1]:8080/x", "http://base/"),
               "http://[::1]:8080/x");
+    // IPv6 + 默认端口剥离（[::1]:80 → 剥）
+    EXPECT_EQ(fetch::resolve_url("http://[::1]:80/x", "http://base/"),
+              "http://[::1]/x");
+    // pct hex 大写 → 小写（%AF 保留 escape 但 hex 字母归一）
+    EXPECT_EQ(fetch::resolve_url("http://%AF.example/x", "http://base/"),
+              "http://%af.example/x");
     // host 小写化（普通域名）
     EXPECT_EQ(fetch::resolve_url("http://ExAmPle.COM/x", "http://base/"),
               "http://example.com/x");

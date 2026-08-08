@@ -24,6 +24,7 @@
 
 #include <quickjs.h>
 
+#include <qjsbind/error.hpp>
 #include <qjsbind/value.hpp>
 
 namespace qjs {

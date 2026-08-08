@@ -83,11 +83,8 @@ add_executable(quickjs_runtime_tests
     tests/fetch_test.cpp
     tests/wpt_runner.cpp
     tests/socks5_test.cpp
-    tests/cheerio_test.cpp
     tests/cheerio_bench_test.cpp
     tests/cheerio_fast_test.cpp
-    tests/min_fast_tmp.cpp
-    tests/cheerio_spec_runner.cpp
     tests/mini_task_test.cpp
 )
 target_link_libraries(quickjs_runtime_tests PRIVATE
@@ -102,8 +99,6 @@ target_link_libraries(quickjs_runtime_tests PRIVATE
     ZLIB::ZLIB
 )
 
-target_compile_definitions(quickjs_runtime_tests PRIVATE
-    CHEERIO_TEST_DIR="${CMAKE_SOURCE_DIR}/tests/cheerio")
 # Debug 构建 JS_CallInternal 栈帧 ~21KB：默认 1MB 线程栈下 ~48 层 JS 递归
 # 即崩（QuickJS 栈检查被 __chkstk 抢先）。给测试进程 16MB 栈。
 set_target_properties(quickjs_runtime_tests PROPERTIES

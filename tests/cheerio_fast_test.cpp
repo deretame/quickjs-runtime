@@ -1,157 +1,225 @@
-// cheerio_fast_test.cpp —— 方案 A：lexbor C 树句柄基础设施测试
+// cheerio_fast_test.cpp —— BreezeHtml 只读选择集 API 测试
+//
+// 覆盖：load/查询/遍历/过滤/读取（attr/text/html/val）/迭代（each/map/toArray）
+// /空集语义/无效选择器抛错/GC 生命周期。
 #include <gtest/gtest.h>
-#include <qjsbind/cheerio/lexbor_api.hpp>
-#include <qjsbind/loop.hpp>
+#include <qjsbind/cheerio/cheerio.hpp>
 #include <qjsbind/qjsbind.hpp>
 
 using namespace qjs;
 
 namespace {
 
-struct CheerioFastFixture : ::testing::Test {
+struct BreezeHtmlFixture : ::testing::Test {
     Runtime rt;
     Context ctx = rt.main_context();
-    bool install_ok = false;
 
-    CheerioFastFixture()
+    BreezeHtmlFixture() { qjsbind::cheerio::install_cheerio(ctx); }
+
+    // 求值并断言无异常，返回字符串结果
+    std::string eval_str(const char* code)
     {
-        try {
-            qjsbind::cheerio::lxb_handle::install_cheerio_fast(ctx);
-            install_ok = true;
-        } catch (...) {
-            install_ok = false;
-        }
+        Value r = ctx.eval(code);
+        EXPECT_FALSE(r.is_exception()) << r.as<std::string>();
+        if (r.is_exception())
+            return "<exception>";
+        return r.as<std::string>();
     }
 };
 
-// 惰性属性：domhandler 兼容的 children/name/attribs/data 访问
-TEST_F(CheerioFastFixture, HandleBasics)
+// 查询 + 读取：length/text/attr/html；空集与缺失属性语义
+TEST_F(BreezeHtmlFixture, QueryBasics)
 {
-    ASSERT_TRUE(install_ok);
-    Value r = ctx.eval(R"JS(
-        const $ = __lxb_load('<ul id="fruits"><li class="apple">Apple</li></ul>');
-        const root = $[0];
-        const body = root.children[0].children[1]; // html -> body
-        const ul = body.children[0];
-        const li = ul.children[0];
-        root.type + '|' + root.children.length + '|' + root.children[0].name
-        + '|' + body.name + '|' + ul.name + '|' + li.name
-        + '|' + li.attribs['class'] + '|' + ul.attribs.id
-        + '|' + li.children[0].data + '|' + li.children[0].type
-        // 句柄模式：parent 返回新句柄对象（非同一引用）；语义比较用 name
-        + '|' + (li.parent.name === 'ul') + '|' + (li.prev === null);
-    )JS");
-    ASSERT_FALSE(r.is_exception()) << r.as<std::string>();
-    EXPECT_EQ(r.as<std::string>(),
-              "root|1|html|body|ul|li|apple|fruits|Apple|text|true|true");
-}
-
-// 生命周期：$ 被 GC 后，句柄仍持有文档可读；多次 load + GC 无崩溃
-TEST_F(CheerioFastFixture, GcLifecycle)
-{
-    ASSERT_TRUE(install_ok);
-    Value r = ctx.eval(R"JS(
-        // 块内 $ 释放后 root 句柄仍可读
-        let root;
-        {
-            const $ = __lxb_load('<p>keep</p>');
-            root = $[0];
-        }
-        // 批量 load 制造垃圾文档
-        for (let i = 0; i < 50; i++) __lxb_load('<div>g' + i + '</div>');
-        const kept = root.children[0].children[1].children[0].name;
-        kept;
-    )JS");
-    ASSERT_FALSE(r.is_exception()) << r.as<std::string>();
-    EXPECT_EQ(r.as<std::string>(), "p");
-    // 强制 GC 后再操作：无悬垂、无崩溃
-    JS_RunGC(JS_GetRuntime(ctx.raw()));
-    r = ctx.eval("__lxb_load('<span>after</span>')[0].children[0].children[1]"
-                 ".children[0].name");
-    ASSERT_FALSE(r.is_exception()) << r.as<std::string>();
-    EXPECT_EQ(r.as<std::string>(), "span");
-}
-
-// C 树选择器匹配：id/class/组合/伪类/属性
-TEST_F(CheerioFastFixture, SelectorMatching)
-{
-    ASSERT_TRUE(install_ok);
-    Value r = ctx.eval(R"JS(
-        const $ = __lxb_load(
-            '<ul id="fruits"><li class="apple">Apple</li>' +
-            '<li class="orange">Orange</li><li class="pear">Pear</li></ul>' +
-            '<table><tr><td class="num">1</td><td class="cell">a</td></tr>' +
-            '<tr><td class="num">2</td><td class="cell">b</td></tr></table>');
-        const names = (sel) => {
-            const r = $(sel);
-            let out = [];
-            for (let i = 0; i < r.length; i++) out.push(r[i].name + '.' + r[i].attribs['class']);
-            return out.join(',');
-        };
-        names('li') + '|' + names('li.apple') + '|' + names('ul > li')
-        + '|' + names('td.cell') + '|' + names('li:first-child')
-        + '|' + names('li:last-child') + '|' + names('td:nth-child(2)')
-        + '|' + names('td[class]') + '|' + names('#fruits');
-    )JS");
-    ASSERT_FALSE(r.is_exception()) << r.as<std::string>();
-    EXPECT_EQ(r.as<std::string>(),
-              "li.apple,li.orange,li.pear|li.apple|li.apple,li.orange,li.pear|"
-              "td.cell,td.cell|li.apple|li.pear|td.cell,td.cell|"
-              "td.num,td.cell,td.num,td.cell|ul.undefined");
-}
-
-// $(node) 包装 + 数组包装
-TEST_F(CheerioFastFixture, WrapNodeAndArray)
-{
-    ASSERT_TRUE(install_ok);
-    Value r = ctx.eval(R"JS(
-        const $ = __lxb_load('<div><p>a</p><p>b</p></div>');
-        const p0 = $('p')[0];
-        const wrapped = $(p0);
-        const arr = $([p0, $('p')[1]]);
-        wrapped.length + '|' + wrapped[0].children[0].data
-        + '|' + arr.length + '|' + arr[1].children[0].data;
-    )JS");
-    ASSERT_FALSE(r.is_exception()) << r.as<std::string>();
-    EXPECT_EQ(r.as<std::string>(), "1|a|2|b");
-}
-
-// cheerio.load + API：查询/属性/文本/序列化/class/修改
-TEST_F(CheerioFastFixture, ApiBasics)
-{
-    ASSERT_TRUE(install_ok);
-    Value r = ctx.eval(R"JS(
-        const $ = cheerio.load(
+    EXPECT_EQ(eval_str(R"JS(
+        const $ = BreezeHtml.load(
             '<ul id="fruits"><li class="apple">Apple</li>' +
             '<li class="orange">Orange</li></ul>');
-        const li = $('li');
-        const apple = $('li.apple');
-        const t1 = apple.attr('class');
-        apple.attr('data-x', '42');
-        const t2 = apple.attr('data-x');
-        const t3 = apple.text();
-        const t4 = li.length;
-        apple.addClass('red');
-        const t5 = apple.hasClass('red');
-        apple.removeClass('apple');
-        const t6 = apple.attr('class');
-        const t7 = $('li').filter('.orange').text();
-        const t8 = $('li').first().text();
-        const t9 = $('li').last().text();
-        const t10 = $('ul').find('li').length;
-        const t11 = $('li').parent().attr('id');
-        apple.append('<em>X</em>');
-        const t12 = $('li.red em').length;
-        const t14 = $('ul').html().indexOf('em') >= 0;
-        $('li.red').remove();
-        const t13 = $('li').length;
-        t1 + '|' + t2 + '|' + t3 + '|' + t4 + '|' + t5 + '|' + t6
-        + '|' + t7 + '|' + t8 + '|' + t9 + '|' + t10 + '|' + t11
-        + '|' + t12 + '|' + t13 + '|' + t14;
+        [
+            $('li').length,                   // 2
+            $('li.apple').text(),             // Apple
+            $('li').text(),                   // AppleOrange（拼接）
+            $('li.orange').attr('class'),     // orange
+            typeof $('li').attr('missing'),   // undefined：属性缺失
+            typeof $('nosuch').attr('class'), // undefined：空集
+            $('ul').html(),                   // innerHTML
+            typeof $('nosuch').html(),        // undefined：空集
+            $('nosuch').text(),               // ''
+            $('nosuch').length,               // 0
+        ].join('|');
+    )JS"),
+              "2|Apple|AppleOrange|orange|undefined|undefined|"
+              "<li class=\"apple\">Apple</li><li class=\"orange\">Orange</li>"
+              "|undefined||0");
+}
+
+// 遍历：find/first/last/eq/parent/children/siblings/next/prev/closest
+TEST_F(BreezeHtmlFixture, Traversal)
+{
+    EXPECT_EQ(eval_str(R"JS(
+        const $ = BreezeHtml.load(
+            '<div id="wrap"><p class="a">A</p><p class="b">B</p>' +
+            '<span>S</span><p class="c">C</p></div>');
+        const ps = $('p');
+        [
+            ps.length,                      // 3
+            ps.first().attr('class'),       // a
+            ps.last().attr('class'),        // c
+            ps.eq(1).text(),                // B
+            ps.eq(-1).attr('class'),        // c（负数从尾部数）
+            ps.eq(9).length,                // 0（越界空集）
+            $('p.b').parent().attr('id'),   // wrap
+            $('#wrap').children().length,   // 4
+            $('#wrap').children('p').length, // 3（选择器过滤）
+            $('p.b').siblings().length,     // 3（除自身的元素兄弟）
+            $('p.b').siblings('p').length,  // 2
+            $('p.b').next().text(),         // S
+            $('p.b').next('span').text(),   // S（紧邻兄弟匹配选择器）
+            $('p.b').next('p').length,      // 0（紧邻兄弟不是 p → 空集）
+            $('p.b').prev().text(),         // A
+            $('p.b').closest('div').attr('id'), // wrap（含自身向上）
+            $('p.b').closest('p').attr('class'), // b（自身匹配）
+            $('#wrap').find('p').length,    // 3
+        ].join('|');
+    )JS"),
+              "3|a|c|B|c|0|wrap|4|3|3|2|S|S|0|A|wrap|b|3");
+}
+
+// 相对选择器 / :scope
+TEST_F(BreezeHtmlFixture, RelativeSelector)
+{
+    EXPECT_EQ(eval_str(R"JS(
+        const $ = BreezeHtml.load('<div id="a"><ul><li>1</li><li>2</li></ul></div>');
+        [
+            $('div').find('> ul').length,      // 1（组合器开头 → :scope 包装）
+            $('ul').find('> li').length,       // 2
+            $('ul').find(':scope > li').length, // 2
+        ].join('|');
+    )JS"),
+              "1|2|2");
+}
+
+// filter/has/slice/index/is
+TEST_F(BreezeHtmlFixture, SetOps)
+{
+    EXPECT_EQ(eval_str(R"JS(
+        const $ = BreezeHtml.load(
+            '<ul><li class="x">1</li><li>2</li><li class="x">3</li><li>4</li></ul>');
+        const lis = $('li');
+        [
+            lis.filter('.x').text(),          // 13（选择器过滤）
+            lis.filter((i, el) => el.text() === '2').length, // 1（回调第二参为选择集）
+            lis.filter(function () { return this.text() === '3'; }).length, // 1（this 绑定）
+            $('ul').has('li.x').length,       // 1
+            $('ul').has('nosuch').length,     // 0
+            lis.slice(1, 3).text(),           // 23
+            lis.slice(-2).text(),             // 34（负数）
+            lis.eq(1).index(),                // 1（元素兄弟序号）
+            $('nosuch').index(),              // -1
+            lis.eq(0).is('.x'),               // true
+            lis.eq(1).is('.x'),               // false
+        ].join('|');
+    )JS"),
+              "13|1|1|1|0|23|34|1|-1|true|false");
+}
+
+// each/map/toArray：回调签名 (index, 单元素选择集)；each 中断；map 结果
+// {length, get()}
+TEST_F(BreezeHtmlFixture, Iteration)
+{
+    EXPECT_EQ(eval_str(R"JS(
+        const $ = BreezeHtml.load('<ul><li>a</li><li>b</li><li>c</li></ul>');
+        const seen = [];
+        $('li').each((i, el) => seen.push(i + ':' + el.text()));
+        const early = [];
+        $('li').each((i, el) => { early.push(el.text()); return el.text() !== 'b'; });
+        const mapped = $('li').map((i, el) => i === 1 ? null : el.text().toUpperCase());
+        const arr = $('li').toArray();
+        [
+            seen.join(','),     // 0:a,1:b,2:c
+            early.join(''),     // ab（=== false 中断）
+            mapped.length,      // 2（null 跳过）
+            mapped.get().join(''), // AC
+            arr.length,         // 3
+            arr[1].text(),      // b（toArray 元素为单元素选择集）
+        ].join('|');
+    )JS"),
+              "0:a,1:b,2:c|ab|2|AC|3|b");
+}
+
+// val()：cheerio 语义（input/textarea/select/option/checkbox）
+TEST_F(BreezeHtmlFixture, ValSemantics)
+{
+    EXPECT_EQ(eval_str(R"JS(
+        const $ = BreezeHtml.load(
+            '<form>' +
+            '<input id="i1" value="hello">' +
+            '<input id="i2" type="checkbox">' +
+            '<input id="i3">' +
+            '<textarea id="t1">foobar</textarea>' +
+            '<select id="s1"><option value="a">A</option>' +
+            '<option value="b" selected>B</option></select>' +
+            '<select id="s2"><option>x</option><option value="y">Y</option></select>' +
+            '</form>');
+        [
+            $('#i1').val(),          // hello（value 属性）
+            $('#i2').val(),          // on（checkbox 无 value）
+            typeof $('#i3').val(),   // undefined（无 value）
+            $('#t1').val(),          // foobar（textarea → 文本）
+            $('#s1').val(),          // b（selected option）
+            $('#s2').val(),          // x（第一个 option，无 value → 文本）
+            typeof $('nosuch').val(), // undefined（空集）
+            $('option:checked').attr('value'), // b（:checked 匹配 selected 裸属性）
+            $('#s1 option').toArray()[1].attr('selected') === '', // true（裸属性 → 空串）
+        ].join('|');
+    )JS"),
+              "hello|on|undefined|foobar|b|x|undefined|b|true");
+}
+
+// $ 调用形式：$(selection) 原样返回；$(其他) 空集；无效选择器/参数抛错
+TEST_F(BreezeHtmlFixture, ApiCallForms)
+{
+    EXPECT_EQ(eval_str(R"JS(
+        const $ = BreezeHtml.load('<div><p>a</p></div>');
+        const p = $('p');
+        let err1 = '', err2 = '', err3 = '';
+        try { $('ul >'); } catch (e) { err1 = e.message; }
+        try { $('li:bah'); } catch (e) { err2 = e.message; }
+        try { BreezeHtml.load(); } catch (e) { err3 = e.message; }
+        [
+            $(p) === p,     // true（选择集原样返回）
+            $(p).text(),    // a
+            $(null).length, // 0
+            $(42).length,   // 0
+            err1,           // Invalid selector: ul >
+            err2,           // Unknown pseudo-class :bah
+            err3,           // BreezeHtml.load() expects a string
+        ].join('|');
+    )JS"),
+              "true|a|0|0|Invalid selector: ul >|Unknown pseudo-class :bah|"
+              "BreezeHtml.load() expects a string");
+}
+
+// 生命周期：选择集释放后派生集仍持有文档；批量 load + GC 无崩溃
+TEST_F(BreezeHtmlFixture, GcLifecycle)
+{
+    Value r = ctx.eval(R"JS(
+        let keep;
+        {
+            const $ = BreezeHtml.load('<p>keep</p>');
+            keep = $('p');
+        }
+        // 批量 load 制造垃圾文档
+        for (let i = 0; i < 50; i++) BreezeHtml.load('<div>g' + i + '</div>');
+        globalThis.__keep = keep;
+        keep.text();
     )JS");
     ASSERT_FALSE(r.is_exception()) << r.as<std::string>();
-    EXPECT_EQ(r.as<std::string>(),
-              "apple|42|Apple|2|true|red|Orange|Apple|Orange|2|fruits|1|1|true");
+    EXPECT_EQ(r.as<std::string>(), "keep");
+    // 强制 GC 后再操作：无悬垂、无崩溃
+    JS_RunGC(JS_GetRuntime(ctx.raw()));
+    EXPECT_EQ(eval_str("__keep.text()"), "keep");
+    EXPECT_EQ(eval_str("BreezeHtml.load('<span>after</span>')('span').text()"),
+              "after");
 }
 
 } // namespace

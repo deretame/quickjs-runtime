@@ -5,19 +5,26 @@
 
 ## 维护约定
 
-- 每条问题一个编号 `KI-xxx`，按分类前缀分段：`01-09` 编译器 / `10-19` quickjs-ng / `20-29` stdexec / `30-39` qjsbind 设计限制 / `40+` 工具链与环境。
+- 每条问题一个编号 `KI-xxx`，按分类前缀分段：`01-09` 编译器/语言语义 / `10-19` quickjs-ng / `20-29` stdexec / `30-39` qjsbind 设计限制 / `40+` 工具链与环境。
 - 风险标记：★ = 高（会静默出错/难排查），● = 中，○ = 低（文档性）。
 - 状态：`已规避`（有明确规避法并已实现）/ `设计规避`（设计层面避免触碰）/ `待验证`（依赖特定版本/场景，未实测）。
 - 修改任何实现时，若命中下表问题，先更新状态或复现条件。
 
 ---
 
-## 01–09 编译器（MSVC）
+## 01–09 编译器 / 语言语义（MSVC 环境实测）
 
-### KI-001 ★ MSVC 协程 lambda 参数损坏
-- **现象**：MSVC 下带参数的协程 lambda 在 `co_await` 恢复后读到垃圾参数值。
-- **原因**：lambda 捕获与协程帧的交互缺陷（MSVC 实现问题）。
-- **规避**：**一切协程写成独立的自由函数**；需要"方法"语义时用自由函数 + `qjs::This<T>` 糖。
+### KI-001 ★ 协程 lambda 捕获悬垂（生命周期问题，非 MSVC bug）
+- **现象**：带捕获的协程 lambda 在 `co_await` 恢复后读到垃圾值/崩溃（最早在 MSVC 下发现，曾误判为编译器参数损坏缺陷）。
+- **原因**：标准语义，与编译器无关。**协程只把形参拷进协程帧**（值形参因此安全；引用形参只存引用本身）；lambda 的捕获存在闭包对象里、**不进帧**——`[data] { ... }` 的闭包是临时对象，协程首次挂起后随完整表达式结束而析构，恢复时再访问捕获即 use-after-free。成员协程的 `this` 同理（隐式对象形参不进帧）。
+- **规避**：**一切协程写成独立的自由函数**；需要"方法"语义时用自由函数 + `qjs::This<T>` 糖。临时写 lambda 也行，但**禁止捕获**，值一律走（值）形参并立即调用：
+  ```cpp
+  // ✗ data 随闭包临时对象析构而悬垂，恢复后读到垃圾值
+  auto bad = [data]() -> task<int> { co_await cb(data); };
+
+  // ✓ 值形参拷进协程帧（自由函数写法同理安全）
+  auto ok = [](int data) -> task<int> { co_await cb(data); }(data);
+  ```
 - **状态**：设计规避（绑定层把自由函数当一等公民，天然兼容）。
 
 ### KI-002 ● 显式特化的成员函数体非惰性
@@ -298,3 +305,39 @@ untime/third_party/...`，errno=22）→ 用 `std::fopen`
 - **规避**：按 HTML 标准 multipart/form-data parsing algorithm 重写——pos 每轮严格递增保证终止；delimiter 后仅允许 transport padding（tab/space）+ `\r\n`，结束标记 `--` 之后必须到输入末尾；结构不合法返回 `std::nullopt`，调用方 reject TypeError。
 - **状态**：已修复（wpt response-form-data.html 14/14 全过）。
 - **教训**："第 N 次并发操作卡死"未必是并发/异步层问题——先把每个操作换成相同输入做对照，排除数据相关的确定性死循环，再往 stdexec/调度层挖。
+
+## 60+ cheerio → BreezeHtml 只读子集（2026-08-08 重构）
+
+> 重构后：`include/qjsbind/cheerio/` 只提供 **BreezeHtml 只读选择集 API**
+> （cheerio 子集），全部在 lexbor C 树上实现，QuickJS 侧只有不可变选择集句柄。
+> JS bundle 方案（`js/` 全量移植 + `cheerio_js_bundle.hpp`）与官方测试套件
+> （`tests/cheerio/`、spec runner）已随重构删除。
+> API：`BreezeHtml.load(html) -> $`（可调用）；`$(selector)` / `$(selection)`；
+> 遍历 find/first/last/eq/closest/parent/children/siblings/next/prev/filter/
+> has/slice/index/is，读取 attr/text/html/val，迭代 toArray/each/map
+> （map 返回 `{ length, get() }`）。
+> 无 DOM 修改能力（append/remove/attr 写等明确不做）——需要时请引入完整 cheerio。
+
+### KI-060 ○ cheerio.load(options)（已关闭：设计如此）
+- 只读子集只支持 `BreezeHtml.load(html)`，无 options 参数。
+
+### KI-061 ○ map() 回调返回任意 JS 值（已修复）
+- map 结果为普通 JS 对象 `{ length, get() }`（结果数组独立于选择集存储），
+  回调可返回任意 JS 值（null/undefined 跳过，与 cheerio 一致）。
+
+### KI-062 ○ find($) 语义差异（已关闭：只接受字符串）
+- find 只接受字符串选择器，官方 `find($)` 的内部实现怪癖不再涉及。
+
+### KI-063 ○ manipulation / attributes 方法面（已关闭：明确不做）
+- append/remove/wrap/attr 写/addClass 等修改能力不属于本子集。
+
+### KI-064 ● lexbor HTML5 嵌套修正与 htmlparser2 不一致
+- **现象**：`<ul><ul>`、`<tr>` 等非法嵌套在 lexbor 按 HTML5 解析器修正（隐式闭合/移出），cheerio 官方基于 htmlparser2 宽容解析——少数场景结果不同。
+- **原因**：两种解析器对畸形 HTML 的规范化策略不同。
+- **规避**：尽量用合法 HTML。
+- **状态**：已知差异。
+
+### KI-065 ★ qjs.lib 含临时 DIAG 打印（构建产物残留，待重建）
+- **现象**：为诊断泄漏，临时修改过 quickjs.c（`free_cycles` 泄漏路径加 dump）并重编 qjs.lib；**源码已还原，但 lib 未重编**。
+- **影响**：仅在 Runtime 销毁且检测到残留对象时向 stdout 打印对象信息；功能与正确性无影响。
+- **状态**：待重建（需 vcvars64 环境重编 vcpkg quickjs-ng，或下次 vcpkg 重建自动恢复）。

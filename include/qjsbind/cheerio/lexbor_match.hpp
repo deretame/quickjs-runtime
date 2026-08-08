@@ -1,21 +1,22 @@
-// lexbor_match.hpp —— C 树选择器匹配（方案 A）
+// lexbor_match.hpp —— CSS 选择器解析 + lexbor C 树匹配（内部头文件）
 //
-// 把 lexbor_dom.hpp 的 SelectorMatcher（JS 树版）移植为直接操作
-// lxb_dom_node_t*：无 JS 属性访问，匹配全部在 C 侧完成。
-// 语义对齐：css-select / cheerio（:contains/:scope 映射、nth-child 元素计数等）。
+// 选择器由 lexbor CSS 解析为 lxb_css_selector_list_t，匹配直接在
+// lxb_dom_node_t 树上进行（无 JS 属性访问）。语义对齐 css-select / cheerio：
+// :contains → :lexbor-contains 映射、:scope 绑定匹配上下文、nth-child 只统计
+// 元素兄弟、以组合器开头的相对选择器包装为 :scope <组合器> <rest>。
 #pragma once
 
-#include <qjsbind/cheerio/lexbor_handle.hpp>
-
-#include <lexbor/css/css.h>
-
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <string>
 #include <string_view>
 #include <vector>
 
-namespace qjsbind::cheerio::lxb_handle {
+#include <lexbor/css/css.h>
+#include <lexbor/dom/dom.h>
+
+namespace qjsbind::cheerio {
 
 // ---------------------------------------------------------------------------
 // C 树访问辅助
@@ -25,7 +26,8 @@ inline bool c_node_is_element(lxb_dom_node_t* n)
     return n != nullptr && n->type == LXB_DOM_NODE_TYPE_ELEMENT;
 }
 
-// 属性值（无属性返回 nullptr）
+// 属性值（元素无该属性返回 nullptr；裸属性如 selected/disabled 无值 → 空串，
+// lexbor 此时 attr->value 为 NULL，lxb_dom_attr_value 会返回 nullptr）
 inline const lxb_char_t* c_attr_value(lxb_dom_node_t* el, const char* name,
                                       size_t name_len, size_t* value_len)
 {
@@ -35,6 +37,11 @@ inline const lxb_char_t* c_attr_value(lxb_dom_node_t* el, const char* name,
         lxb_dom_interface_element(el), (const lxb_char_t*)name, name_len);
     if (!a)
         return nullptr;
+    if (a->value == nullptr) {
+        static const lxb_char_t empty = 0;
+        *value_len = 0;
+        return &empty;
+    }
     return lxb_dom_attr_value(a, value_len);
 }
 
@@ -55,7 +62,7 @@ inline std::string c_node_name(lxb_dom_node_t* n)
     return std::string((const char*)nm, len);
 }
 
-// 元素在父元素子节点中的 1-based index（只统计元素兄弟）
+// 元素在父元素子节点中的 1-based index（:nth-child 只统计元素兄弟）
 inline int64_t c_child_index(lxb_dom_node_t* el)
 {
     if (!el->parent)
@@ -83,6 +90,7 @@ inline int64_t c_type_index(lxb_dom_node_t* el)
     return idx + 1;
 }
 
+// 位置 n（1-based）是否满足 a*m + b == n（m >= 0 整数）
 inline bool c_anb_match(long a, long b, int64_t n)
 {
     if (a == 0)
@@ -91,13 +99,47 @@ inline bool c_anb_match(long a, long b, int64_t n)
     return m >= 0 && a * m + b == n;
 }
 
+// 节点文本内容（text/cdata 叶子拼接；注释不计）
+inline void c_collect_text(lxb_dom_node_t* n, std::string& out, int depth)
+{
+    if (depth > 64) // 防御：lexbor 树无环，纯保险
+        return;
+    switch (n->type) {
+        case LXB_DOM_NODE_TYPE_TEXT:
+        case LXB_DOM_NODE_TYPE_CDATA_SECTION: {
+            size_t len = 0;
+            const lxb_char_t* d = lxb_dom_node_text_content(n, &len);
+            out.append((const char*)d, len);
+            return;
+        }
+        case LXB_DOM_NODE_TYPE_ELEMENT:
+        case LXB_DOM_NODE_TYPE_DOCUMENT:
+        case LXB_DOM_NODE_TYPE_DOCUMENT_TYPE:
+        case LXB_DOM_NODE_TYPE_DOCUMENT_FRAGMENT:
+            for (lxb_dom_node_t* c = n->first_child; c; c = c->next)
+                c_collect_text(c, out, depth + 1);
+            return;
+        default:
+            return;
+    }
+}
+
+inline std::string c_text_content(lxb_dom_node_t* n)
+{
+    std::string out;
+    c_collect_text(n, out, 0);
+    return out;
+}
+
 // ---------------------------------------------------------------------------
-// C 树匹配器
+// C 树匹配器。depth 防 :not/:is/:has 伪类相互递归栈溢出。
 // ---------------------------------------------------------------------------
 struct CTreeMatcher {
-    JSContext* ctx;
-    lxb_dom_node_t* scope = nullptr;
+    lxb_dom_node_t* scope = nullptr; // :scope 匹配上下文
 
+    // 从右向左匹配一条 selector 链；el 为当前候选元素。
+    // lexbor 语义：selector->combinator = 该 selector 与 prev selector 的关系
+    // （CLOSE = 复合段内；CHILD/SIBLING/FOLLOWING/DESCENDANT = 与左边段的关系）。
     bool match_chain(lxb_css_selector_t* sel, lxb_dom_node_t* el, int depth = 0)
     {
         if (depth > 64)
@@ -119,8 +161,7 @@ struct CTreeMatcher {
         switch (head->combinator) {
             case LXB_CSS_SELECTOR_COMBINATOR_DESCENDANT: {
                 for (lxb_dom_node_t* p = el->parent; p; p = p->parent) {
-                    if (c_node_is_element(p) &&
-                        match_chain(left, p, depth + 1))
+                    if (c_node_is_element(p) && match_chain(left, p, depth + 1))
                         return true;
                 }
                 return false;
@@ -140,8 +181,7 @@ struct CTreeMatcher {
             }
             case LXB_CSS_SELECTOR_COMBINATOR_FOLLOWING: {
                 for (lxb_dom_node_t* p = el->prev; p; p = p->prev) {
-                    if (c_node_is_element(p) &&
-                        match_chain(left, p, depth + 1))
+                    if (c_node_is_element(p) && match_chain(left, p, depth + 1))
                         return true;
                 }
                 return false;
@@ -158,7 +198,8 @@ struct CTreeMatcher {
                 return true;
 
             case LXB_CSS_SELECTOR_TYPE_ELEMENT: {
-                std::string_view want((const char*)sel->name.data, sel->name.length);
+                std::string_view want((const char*)sel->name.data,
+                                      sel->name.length);
                 return c_node_name(el) == want;
             }
 
@@ -167,15 +208,17 @@ struct CTreeMatcher {
                 const lxb_char_t* v = c_attr_value(el, "id", 2, &vl);
                 if (!v)
                     return false;
-                std::string_view want((const char*)sel->name.data, sel->name.length);
+                std::string_view want((const char*)sel->name.data,
+                                      sel->name.length);
                 return std::string_view((const char*)v, vl) == want;
             }
 
             case LXB_CSS_SELECTOR_TYPE_CLASS: {
-                std::string_view want((const char*)sel->name.data, sel->name.length);
+                std::string_view want((const char*)sel->name.data,
+                                      sel->name.length);
                 if (want == "__lexbor_scope__")
                     return el == scope; // :scope 映射
-                return c_has_class(el, std::string(want));
+                return c_has_class(el, want);
             }
 
             case LXB_CSS_SELECTOR_TYPE_ATTRIBUTE:
@@ -189,6 +232,7 @@ struct CTreeMatcher {
 
             case LXB_CSS_SELECTOR_TYPE_PSEUDO_ELEMENT:
             case LXB_CSS_SELECTOR_TYPE_PSEUDO_ELEMENT_FUNCTION:
+                // css-select 不匹配伪元素
                 return false;
 
             default:
@@ -196,7 +240,8 @@ struct CTreeMatcher {
         }
     }
 
-    bool c_has_class(lxb_dom_node_t* el, const std::string& want)
+    // class 匹配：空格分隔词列表（大小写敏感）
+    bool c_has_class(lxb_dom_node_t* el, std::string_view want)
     {
         size_t vl = 0;
         const lxb_char_t* v = c_attr_value(el, "class", 5, &vl);
@@ -228,7 +273,7 @@ struct CTreeMatcher {
         const lxb_css_selector_attribute_t& a = sel->u.attribute;
         if (a.match == LXB_CSS_SELECTOR_MATCH_EQUAL) {
             if (a.value.data == nullptr)
-                return true; // [attr] 存在性
+                return true; // [attr] 无值 = 存在性检查
             return attr == std::string((const char*)a.value.data, a.value.length);
         }
         std::string value((const char*)a.value.data, a.value.length);
@@ -246,6 +291,7 @@ struct CTreeMatcher {
         };
         switch (a.match) {
             case LXB_CSS_SELECTOR_MATCH_INCLUDE: {
+                // ~= 空格分词
                 size_t pos = 0;
                 while (pos <= attr.size()) {
                     size_t end = attr.find(' ', pos);
@@ -275,45 +321,16 @@ struct CTreeMatcher {
             case LXB_CSS_SELECTOR_MATCH_SUBSTRING: {
                 if (insensitive) {
                     std::string lo_attr = attr, lo_val = value;
-                    for (auto& c : lo_attr) c = (char)std::tolower((unsigned char)c);
-                    for (auto& c : lo_val) c = (char)std::tolower((unsigned char)c);
+                    for (auto& c : lo_attr)
+                        c = (char)std::tolower((unsigned char)c);
+                    for (auto& c : lo_val)
+                        c = (char)std::tolower((unsigned char)c);
                     return lo_attr.find(lo_val) != std::string::npos;
                 }
                 return attr.find(value) != std::string::npos;
             }
             default:
                 return false;
-        }
-    }
-
-    std::string text_content(lxb_dom_node_t* n)
-    {
-        std::string out;
-        collect_text(n, out, 0);
-        return out;
-    }
-
-    void collect_text(lxb_dom_node_t* n, std::string& out, int depth)
-    {
-        if (depth > 64)
-            return;
-        switch (n->type) {
-            case LXB_DOM_NODE_TYPE_TEXT:
-            case LXB_DOM_NODE_TYPE_CDATA_SECTION: {
-                size_t len = 0;
-                const lxb_char_t* d = lxb_dom_node_text_content(n, &len);
-                out.append((const char*)d, len);
-                return;
-            }
-            case LXB_DOM_NODE_TYPE_ELEMENT:
-            case LXB_DOM_NODE_TYPE_DOCUMENT:
-            case LXB_DOM_NODE_TYPE_DOCUMENT_TYPE:
-            case LXB_DOM_NODE_TYPE_DOCUMENT_FRAGMENT:
-                for (lxb_dom_node_t* c = n->first_child; c; c = c->next)
-                    collect_text(c, out, depth + 1);
-                return;
-            default:
-                return;
         }
     }
 
@@ -365,7 +382,7 @@ struct CTreeMatcher {
             case LXB_CSS_SELECTOR_PSEUDO_CLASS_EMPTY:
                 return el->first_child == nullptr;
             case LXB_CSS_SELECTOR_PSEUDO_CLASS_ROOT: {
-                // 文档根元素：parent 是 document（无 parent 的顶层元素）
+                // 文档根元素：parent 是 document
                 if (!el->parent || el->parent->parent)
                     return false;
                 return el->parent->type == LXB_DOM_NODE_TYPE_DOCUMENT;
@@ -407,6 +424,7 @@ struct CTreeMatcher {
                     return false;
                 int64_t pos = idx;
                 if (type == LXB_CSS_SELECTOR_PSEUDO_CLASS_FUNCTION_NTH_LAST_CHILD) {
+                    // 从后数：沿 next 链数元素兄弟
                     pos = 1;
                     for (lxb_dom_node_t* nx = el->next; nx; nx = nx->next) {
                         if (c_node_is_element(nx))
@@ -430,7 +448,7 @@ struct CTreeMatcher {
                         if (c_node_is_element(nx) && c_node_name(nx) == name)
                             ++total;
                     }
-                    idx = total + 1;
+                    idx = total + 1; // 从后数位置 = 后续同类型兄弟数 + 1
                 }
                 return c_anb_match(anb->anb.a, anb->anb.b, idx);
             }
@@ -448,6 +466,7 @@ struct CTreeMatcher {
                 return match_any_list(list, el, depth + 1);
             }
             case LXB_CSS_SELECTOR_PSEUDO_CLASS_FUNCTION_HAS: {
+                // :has(sel)：el 的后代中任一匹配
                 auto* list = (lxb_css_selector_list_t*)sel->u.pseudo.data;
                 if (!list)
                     return false;
@@ -458,10 +477,12 @@ struct CTreeMatcher {
                 if (!c)
                     return false;
                 std::string needle((const char*)c->str.data, c->str.length);
-                std::string hay = text_content(el);
+                std::string hay = c_text_content(el);
                 if (c->insensitive) {
-                    for (auto& ch : hay) ch = (char)std::tolower((unsigned char)ch);
-                    for (auto& ch : needle) ch = (char)std::tolower((unsigned char)ch);
+                    for (auto& ch : hay)
+                        ch = (char)std::tolower((unsigned char)ch);
+                    for (auto& ch : needle)
+                        ch = (char)std::tolower((unsigned char)ch);
                 }
                 return hay.find(needle) != std::string::npos;
             }
@@ -470,6 +491,7 @@ struct CTreeMatcher {
         }
     }
 
+    // selector list（逗号分隔）任一链匹配 el；depth 透传
     bool match_any_list(lxb_css_selector_list_t* list, lxb_dom_node_t* el,
                         int depth = 0)
     {
@@ -482,6 +504,7 @@ struct CTreeMatcher {
         return false;
     }
 
+    // :has：el 后代（不含自身）中任一元素匹配
     bool has_descendant_match(lxb_css_selector_list_t* list, lxb_dom_node_t* el,
                               int depth = 0)
     {
@@ -500,9 +523,10 @@ struct CTreeMatcher {
 // ---------------------------------------------------------------------------
 // CSS 选择器解析 + 查询（parser 生命周期覆盖 list 使用期）
 // ---------------------------------------------------------------------------
-// 解析选择器（含 cheerio 兼容映射）；parser 输出（list 归 parser 所有）
-inline lxb_css_parser_t* parse_selectors(JSContext* jctx,
-                                         const std::string& selector,
+// 解析选择器（含 cheerio 兼容映射）；list 归 parser 所有。
+// 失败返回 nullptr——不抛 C++ 异常（本模块由裸 C 函数回调调用，异常穿
+// quickjs C 栈是 UB），由调用方设置 JS exception。
+inline lxb_css_parser_t* parse_selectors(const std::string& selector,
                                          lxb_css_selector_list_t** out_list)
 {
     lxb_css_parser_t* parser = lxb_css_parser_create();
@@ -542,9 +566,6 @@ inline lxb_css_parser_t* parse_selectors(JSContext* jctx,
                 parser, (const lxb_char_t*)mapped.data(), mapped.size());
         }
         if (list == nullptr) {
-            // 注意：不抛 C++ 异常——本模块函数由裸 JS_NewCFunction 注册，
-            // 异常会穿过 quickjs C 栈（UB）。调用方检测 nullptr 后设置
-            // JS exception 并返回 JS_EXCEPTION。
             lxb_css_parser_destroy(parser, true);
             return nullptr;
         }
@@ -559,10 +580,9 @@ inline lxb_css_parser_t* parse_selectors(JSContext* jctx,
 inline std::vector<lxb_dom_node_t*> c_query_all(lxb_dom_node_t* root,
                                                 lxb_css_selector_list_t* list,
                                                 bool include_self,
-                                                JSContext* ctx = nullptr,
                                                 lxb_dom_node_t* scope = nullptr)
 {
-    CTreeMatcher m{ctx, scope ? scope : root};
+    CTreeMatcher m{scope ? scope : root};
     std::vector<lxb_dom_node_t*> out;
 
     auto matches_any = [&](lxb_dom_node_t* el) {
@@ -576,48 +596,37 @@ inline std::vector<lxb_dom_node_t*> c_query_all(lxb_dom_node_t* root,
     constexpr size_t kMaxNodes = 100000; // 防御（lexbor 树无环，纯保险）
     size_t visited = 0;
     std::vector<lxb_dom_node_t*> stack;
-    if (include_self && c_node_is_element(root)) {
-        if (matches_any(root))
-            out.push_back(root);
-    }
-    // 子节点逆序入栈保持文档序（栈 LIFO：last 先出）
-    std::vector<lxb_dom_node_t*> kids;
-    for (lxb_dom_node_t* c = root->first_child; c; c = c->next)
-        kids.push_back(c);
-    for (auto it = kids.rbegin(); it != kids.rend(); ++it)
-        stack.push_back(*it);
+    // 子节点逆序入栈保持文档序（栈 LIFO：最后的先出）
+    auto push_children = [&](lxb_dom_node_t* n) {
+        size_t base = stack.size();
+        for (lxb_dom_node_t* c = n->first_child; c; c = c->next)
+            stack.push_back(c);
+        std::reverse(stack.begin() + (ptrdiff_t)base, stack.end());
+    };
+    if (include_self && c_node_is_element(root) && matches_any(root))
+        out.push_back(root);
+    push_children(root);
     while (!stack.empty() && visited++ < kMaxNodes) {
         lxb_dom_node_t* n = stack.back();
         stack.pop_back();
         if (c_node_is_element(n) && matches_any(n))
             out.push_back(n);
-        // 子节点逆序入栈保持文档序
-        lxb_dom_node_t* first = n->first_child;
-        if (first) {
-            std::vector<lxb_dom_node_t*> kids;
-            for (lxb_dom_node_t* k = first; k; k = k->next)
-                kids.push_back(k);
-            for (auto it = kids.rbegin(); it != kids.rend(); ++it)
-                stack.push_back(*it);
-        }
+        push_children(n);
     }
     return out;
 }
 
 // 完整查询：root 后代中匹配 selector 的元素（文档序）。
-// 选择器无效时返回空并置 *ok=false（调用方如需抛 JS 错误自行判断），
-// 不抛 C++ 异常。scope：匹配上下文（:scope 伪类绑定，null 时用 root）。
-inline std::vector<lxb_dom_node_t*> c_query_selector(JSContext* jctx,
-                                                     lxb_dom_node_t* root,
+// 选择器无效时返回空并置 *ok=false（调用方如需抛 JS 错误自行判断）。
+inline std::vector<lxb_dom_node_t*> c_query_selector(lxb_dom_node_t* root,
                                                      const std::string& selector,
                                                      bool include_self,
                                                      lxb_dom_node_t* scope,
                                                      bool* ok)
 {
     lxb_css_selector_list_t* list = nullptr;
-    lxb_css_parser_t* parser = parse_selectors(jctx, selector, &list);
+    lxb_css_parser_t* parser = parse_selectors(selector, &list);
     if (!parser) {
-        // 无效选择器：兼容 cheerio（css-select 抛 Error）。由调用方决定。
         if (ok)
             *ok = false;
         return {};
@@ -625,10 +634,9 @@ inline std::vector<lxb_dom_node_t*> c_query_selector(JSContext* jctx,
     if (ok)
         *ok = true;
     std::vector<lxb_dom_node_t*> out =
-        c_query_all(root, list, include_self, jctx, scope);
+        c_query_all(root, list, include_self, scope);
     lxb_css_parser_destroy(parser, true);
     return out;
 }
 
-
-} // namespace qjsbind::cheerio::lxb_handle
+} // namespace qjsbind::cheerio

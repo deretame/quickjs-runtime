@@ -125,8 +125,8 @@ struct WptRunner : ::testing::Test {
                         const std::vector<std::string>& metas)
     {
         qjs::Runtime rt;
+        fetch::Client client{rt.io()}; // 先于 ctx 声明（client 引用被 fetch 全局持有）
         qjs::Context ctx = rt.main_context();
-        fetch::Client client{rt.io()};
         qjsbind::web::install_web_apis(ctx, client);
 
         const std::string shim = read_file(root_dir() + "/tests/wpt_shim.js");

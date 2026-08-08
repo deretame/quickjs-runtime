@@ -47,7 +47,7 @@ struct ScopeJoiner {
         }
     };
 
-    static void run(stdexec::counting_scope& scope, boost::asio::io_context& io)
+    static bool run(stdexec::counting_scope& scope, boost::asio::io_context& io)
     {
         scope.close();
         bool joined = false;
@@ -58,6 +58,9 @@ struct ScopeJoiner {
             if (!joined)
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
+        if (!joined) // 轮询耗尽：join 未完成（慢机/死锁）——调用方据返回值判失败
+            std::fprintf(stderr, "[fetchcore] warning: scope join 超时（20000 轮 poll）\n");
+        return joined;
     }
 };
 
@@ -68,6 +71,7 @@ struct Probe {
     fetch::Client client{io};
     bool done = false;
     bool stopped = false;
+    bool joined = false; // scope join 是否在超时前完成（慢机/死锁可见）
     std::exception_ptr error;
 
     void run(std_exec::task<void> work)
@@ -88,7 +92,7 @@ struct Probe {
             stdexec::prop{stdexec::get_start_scheduler, fetch::io_scheduler{io}});
         // counting_scope 析构要求 state 为 joined——必须 close + join
         // （见 stdexec [exec.simple.counting]；仅 spawn 不 join 会 terminate）
-        ScopeJoiner::run(scope, io);
+        joined = ScopeJoiner::run(scope, io);
     }
 
     std::string error_message() const
@@ -184,6 +188,26 @@ TEST(FetchcoreDirect, RedirectFollow)
         fetch::Response resp = co_await p.client.fetch(std::move(req));
         EXPECT_EQ(resp.status, 200);
         EXPECT_TRUE(resp.redirected);
+        EXPECT_EQ(resp.url, base + "/status.py?code=200");
+    }());
+    ASSERT_TRUE(p.done);
+    ASSERT_FALSE(p.error) << p.error_message();
+}
+
+// Location 带大写 scheme（HTTP://…）：WHATWG 解析器归一为小写后跟随
+// （review should-fix 1——resolve_url 小写化 scheme，传输层大小写不敏感比较）
+TEST(FetchcoreDirect, RedirectSchemeCase)
+{
+    wpt::WptTestServer server("third_party/wpt");
+    const std::string base = server.base_url();
+    const std::string port = base.substr(base.rfind(':') + 1);
+    Probe p;
+    p.run([&]() -> std_exec::task<void> {
+        fetch::Request req;
+        req.url = base + "/redirect.py?location=HTTP://127.0.0.1:" + port +
+                  "/status.py?code=200&redirect_status=302&simple=1";
+        fetch::Response resp = co_await p.client.fetch(std::move(req));
+        EXPECT_EQ(resp.status, 200);
         EXPECT_EQ(resp.url, base + "/status.py?code=200");
     }());
     ASSERT_TRUE(p.done);
@@ -425,7 +449,7 @@ TEST(FetchcoreDirect, MultiInstanceSharedIo)
             | stdexec::upon_stopped([&]() noexcept { done2 = false; }),
         scope.get_token(),
         stdexec::prop{stdexec::get_start_scheduler, fetch::io_scheduler{io}});
-    ScopeJoiner::run(scope, io);
+    EXPECT_TRUE(ScopeJoiner::run(scope, io)) << "scope join 超时";
     EXPECT_TRUE(done1);
     EXPECT_TRUE(done2);
     EXPECT_EQ(r1, "c1");
@@ -460,7 +484,7 @@ TEST(FetchcoreDirect, Socks5)
             | stdexec::upon_stopped([&]() noexcept { ok = false; }),
         scope.get_token(),
         stdexec::prop{stdexec::get_start_scheduler, fetch::io_scheduler{io}});
-    ScopeJoiner::run(scope, io);
+    EXPECT_TRUE(ScopeJoiner::run(scope, io)) << "scope join 超时";
     EXPECT_TRUE(ok) << "经 SOCKS5 隧道请求失败";
 }
 
@@ -492,7 +516,7 @@ TEST(FetchcoreDirect, Https)
             | stdexec::upon_stopped([&]() noexcept { ok = false; }),
         scope.get_token(),
         stdexec::prop{stdexec::get_start_scheduler, fetch::io_scheduler{io}});
-    ScopeJoiner::run(scope, io);
+    EXPECT_TRUE(ScopeJoiner::run(scope, io)) << "scope join 超时";
     ASSERT_TRUE(ok);
     EXPECT_EQ(out, "tls direct");
 }

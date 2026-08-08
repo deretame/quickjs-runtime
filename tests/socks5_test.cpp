@@ -26,8 +26,9 @@ namespace {
 
 struct Socks5Fixture : ::testing::Test {
     Runtime rt;
+    std::unique_ptr<fetch::Client> client; // 先于 ctx 声明：析构逆序（ctx 先），
+                                           // fetch 全局持有的 Client& 在 ctx 生命周期内有效
     Context ctx = rt.main_context();
-    std::unique_ptr<fetch::Client> client;
     qjsbind::net::wpt::WptTestServer wpt{std::string("third_party/wpt")}; // 隧道目标（http）
     std::string base;
 

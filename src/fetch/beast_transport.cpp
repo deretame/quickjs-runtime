@@ -22,6 +22,9 @@
 #include <stdexcept>
 #include <tuple>
 
+#include <cctype>
+#include <cstring>
+
 #include <openssl/bio.h>
 #include <openssl/err.h>
 #include <openssl/pem.h>
@@ -44,18 +47,27 @@ struct ParsedUrl {
 };
 
 // URL 解析：boost::urls（RFC 3986/WHATWG 兼容）；仅 http/https。
+// scheme 大小写不敏感比较（HTTP:// 等大写形式与 WHATWG 语义一致）。
 // 校验失败抛 std::invalid_argument。
 ParsedUrl parse_url(const std::string& url) {
     auto r = boost::urls::parse_uri_reference(url);
     if (r.has_error())
         throw std::invalid_argument("url: 无法解析");
     const auto& uv = *r;
-    if (uv.scheme() != "http" && uv.scheme() != "https")
+    auto scheme_eq = [&](const char* s) {
+        const std::string_view sc = uv.scheme();
+        return sc.size() == std::strlen(s) &&
+               std::equal(sc.begin(), sc.end(), s,
+                          [](char a, char b) { return (a | 32) == b; });
+    };
+    if (!scheme_eq("http") && !scheme_eq("https"))
         throw std::invalid_argument("url: 仅支持 http/https scheme");
     if (uv.host().empty())
         throw std::invalid_argument("url: 缺少 host");
     ParsedUrl out;
     out.scheme = std::string(uv.scheme());
+    for (auto& c : out.scheme)
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     out.host = std::string(uv.host()); // IPv6 文字地址不带方括号（host_name_verification 需要）
     out.port = uv.has_port() ? std::string(uv.port())
                              : (out.scheme == "https" ? "443" : "80");

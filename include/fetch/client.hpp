@@ -30,15 +30,26 @@
 #include <utility>
 #include <vector>
 
+#include <cctype>
+
 namespace fetch {
 
 // 相对 Location 以当前 URL 为 base 解析（boost::urls；失败抛 fetch::Error）。
 // 与绑定层 UrlImpl::parse 对齐：boost 严格语法拒绝的字符（非 ASCII、
 // 裸 % 等 WHATWG 允许的）→ 宽松 percent-encode 重试（wpt
-// redirect-location-escape 覆盖原始 UTF-8 字节的 Location）。
+// redirect-location-escape 覆盖原始 UTF-8 字节的 Location）；
+// scheme 小写化（HTTP:// 等大写 scheme 在 WHATWG 解析器下归一为小写，
+// 否则下一跳传输层的 "http" 比较会拒绝——review should-fix）。
 inline std::string resolve_url(const std::string& loc, const std::string& base)
 {
-    auto relax = [](std::string_view url) {
+    auto normalize_scheme = [](boost::urls::url& u) {
+        if (u.has_scheme() && !u.scheme().empty()) {
+            std::string s(u.scheme());
+            for (auto& c : s)
+                c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            u.set_scheme(s);
+        }
+    };    auto relax = [](std::string_view url) {
         size_t auth_end = 0;
         const size_t scheme_end = url.find("://");
         if (scheme_end != std::string_view::npos) {
@@ -83,6 +94,7 @@ inline std::string resolve_url(const std::string& loc, const std::string& base)
     }
     if ((*r).has_scheme()) {
         boost::urls::url u(*r);
+        normalize_scheme(u);
         return std::string(u.buffer());
     }
     auto rb = boost::urls::parse_uri_reference(base);
@@ -96,6 +108,7 @@ inline std::string resolve_url(const std::string& loc, const std::string& base)
     auto res = u.resolve(*r); // 原地解析（boost 1.91：返回 result<void> 仅作错误检查）
     if (res.has_error())
         throw Error("fetch: 相对解析失败");
+    normalize_scheme(u);
     return std::string(u.buffer());
 }
 

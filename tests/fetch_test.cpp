@@ -25,8 +25,9 @@ namespace {
 
 struct FetchFixture : ::testing::Test {
     Runtime rt;
+    fetch::Client client{rt.io()}; // 先于 ctx 声明：析构逆序（ctx 先），
+                                   // fetch 全局持有的 Client& 在 ctx 生命周期内有效
     Context ctx = rt.main_context();
-    fetch::Client client{rt.io()};
 
     FetchFixture()
     {

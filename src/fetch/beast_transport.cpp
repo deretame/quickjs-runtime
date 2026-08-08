@@ -65,6 +65,14 @@ ParsedUrl parse_url(const std::string& url) {
         throw std::invalid_argument("url: 仅支持 http/https scheme");
     if (uv.host().empty())
         throw std::invalid_argument("url: 缺少 host");
+    // 拒绝含控制字符的 host（pct-encoded %0d%0a 等解码后进 Host 头/SNI/TLS
+    // 校验——security review LOW；合法 reg-name 不含控制字符）
+    {
+        const std::string h = std::string(uv.host());
+        for (unsigned char c : h)
+            if (c < 0x20 || c == 0x7F)
+                throw std::invalid_argument("url: host 含控制字符");
+    }
     ParsedUrl out;
     out.scheme = std::string(uv.scheme());
     for (auto& c : out.scheme)

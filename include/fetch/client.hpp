@@ -19,6 +19,7 @@
 #include <fetch/transport.hpp>
 #include <fetch/middleware.hpp>
 #include <fetch/error.hpp>
+#include <fetch/url_check.hpp>
 #include <fetch/beast_transport.hpp>
 
 #include <boost/asio/io_context.hpp>
@@ -210,6 +211,7 @@ inline std_exec::task<Response> Client::fetch(Request req, std::stop_token st)
     std::string body = req.body;
     const int kMaxRedirects = opt_.max_redirects;
     for (int hop = 0; hop <= kMaxRedirects; ++hop) {
+        check_url_ports(url); // 每跳检查（含初始 URL）：blocked 端口 → 抛 Error
         Request rq;
         rq.method = method;
         rq.url = url;

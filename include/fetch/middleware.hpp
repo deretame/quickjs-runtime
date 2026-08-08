@@ -85,8 +85,14 @@ class DecompressSource : public BodySource {
 public:
     enum class Kind { Gzip, Deflate, Brotli };
 
-    DecompressSource(std::shared_ptr<BodySource> upstream, Kind kind)
-        : upstream_(std::move(upstream)), kind_(kind)
+    // 单块输出上限：防高压缩比输入在单次 read() 内无限膨胀
+    //（64 KiB 输入最坏可解出 ~66 MB；限制后内存峰值受控，流语义不变）
+    static constexpr size_t kMaxChunk = 1024 * 1024;
+
+    // total_limit：可选总解压字节上限（0 = 无限制；超限 → read 抛异常）
+    DecompressSource(std::shared_ptr<BodySource> upstream, Kind kind,
+                     size_t total_limit = 0)
+        : upstream_(std::move(upstream)), kind_(kind), total_limit_(total_limit)
     {
         if (kind_ == Kind::Brotli) {
             br_state_ = BrotliDecoderCreateInstance(nullptr, nullptr, nullptr);
@@ -144,8 +150,12 @@ public:
             }
             if (stream_end_)
                 in_.clear(); // 流尾后的 trailing 字节丢弃（zlib/brotli 均允许）
-            if (!out.empty())
+            if (!out.empty()) {
+                total_ += out.size();
+                if (total_limit_ && total_ > total_limit_)
+                    throw std::runtime_error("解压总量超过上限");
                 co_return out;
+            }
             if (eof_upstream_ && in_.empty()) {
                 // 上游 EOF：解码器收尾检查
                 finish(out);
@@ -207,6 +217,8 @@ private:
                 in_.erase(0, consumed);
                 return true;
             }
+            if (out.size() >= kMaxChunk)
+                break; // 单块上限：中断解压，剩余输入留给下次 read()
             if (rc == Z_OK && z_.avail_in == 0 && z_.avail_out > 0)
                 break; // 输入耗尽
         } while (z_.avail_out == 0);
@@ -241,6 +253,8 @@ private:
                 stream_end_ = true;
                 break;
             }
+            if (out.size() >= kMaxChunk)
+                break; // 单块上限：中断解码，剩余输入留给下次 read()
             if (avail_in == 0 && avail_out > 0)
                 break; // 输入耗尽
         }
@@ -273,6 +287,8 @@ private:
     bool eof_upstream_ = false;
     bool finished_ = false;
     bool stream_end_ = false;
+    size_t total_ = 0;       // 已解压总字节（超 total_limit_ 抛异常）
+    size_t total_limit_ = 0; // 0 = 无限制
     bool fallback_ = false;       // deflate：允许裸 deflate 回退
     bool fallback_tried_ = false;
     z_stream z_{};

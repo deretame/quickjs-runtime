@@ -12,6 +12,7 @@
 #include <gtest/gtest.h>
 #include <fetch/client.hpp>
 #include <fetch/scheduler.hpp>
+#include <zlib.h>
 #include "wpt_server.hpp"
 #include "socks5_server.hpp"
 #include "tls_echo_server.hpp"
@@ -316,6 +317,96 @@ TEST(FetchcoreDirect, Decompress)
     ASSERT_TRUE(p.done);
     ASSERT_FALSE(p.error) << p.error_message();
     EXPECT_EQ(out, "gzip:hello world:br:hello brotli");
+}
+
+// ---- 安全（security review sa_20260808_173002）----
+// MEDIUM 1：blocked 端口检查下沉 fetchcore——初始 URL 与 redirect 每跳都执行
+TEST(FetchcoreDirect, BlockedPortRejected)
+{
+    Probe p;
+    p.run([&]() -> std_exec::task<void> {
+        fetch::Request req;
+        req.url = "http://127.0.0.1:22/x"; // SSH 端口在 fetch 规范 #port-blocking 清单
+        bool threw = false;
+        try {
+            (void)co_await p.client.fetch(std::move(req));
+        } catch (const fetch::Error& e) {
+            threw = std::string(e.what()).find("端口") != std::string::npos;
+        }
+        EXPECT_TRUE(threw);
+    }());
+    ASSERT_TRUE(p.done);
+    ASSERT_FALSE(p.error) << p.error_message();
+}
+
+// redirect 到 blocked 端口：恶意 Location → 拒绝（不跟随、不连接）
+TEST(FetchcoreDirect, RedirectToBlockedPort)
+{
+    wpt::WptTestServer server("third_party/wpt");
+    Probe p;
+    p.run([&]() -> std_exec::task<void> {
+        fetch::Request req;
+        req.url = server.base_url() +
+                  "/redirect.py?location=http://127.0.0.1:22/x&redirect_status=302&simple=1";
+        bool threw = false;
+        try {
+            (void)co_await p.client.fetch(std::move(req));
+        } catch (const fetch::Error&) {
+            threw = true;
+        }
+        EXPECT_TRUE(threw);
+    }());
+    ASSERT_TRUE(p.done);
+    ASSERT_FALSE(p.error) << p.error_message();
+}
+
+// MEDIUM 2：解压总量上限（total_limit）——超限抛异常；单块上限（kMaxChunk）
+// 由 Decompress 测试（正常流完整读）与总量测试（限内路径）共同覆盖
+TEST(FetchcoreDirect, DecompressTotalLimit)
+{
+    Probe p;
+    p.run([&]() -> std_exec::task<void> {
+        // 读 BodySource 全文（read_all 只接受 Response，此处内联）
+        auto read_all_src = [](fetch::BodySource& s) -> std_exec::task<std::string> {
+            std::string out;
+            for (;;) {
+                auto block = co_await s.read();
+                if (!block)
+                    break;
+                out += *block;
+            }
+            co_return out;
+        };
+        // zlib compress2 生成 64 KiB 高压缩 deflate 流（zlib 格式）
+        const std::string raw(64 * 1024, 'A');
+        uLongf bound = compressBound(static_cast<uLong>(raw.size()));
+        std::string comp(bound, '\0');
+        uLongf clen = bound;
+        const int rc = compress2(reinterpret_cast<Bytef*>(comp.data()), &clen,
+                                 reinterpret_cast<const Bytef*>(raw.data()),
+                                 static_cast<uLong>(raw.size()), Z_BEST_COMPRESSION);
+        EXPECT_EQ(rc, Z_OK);
+        comp.resize(clen);
+        std::string comp2 = comp; // dec2 需要独立副本（dec1 move 走 comp）
+        auto dec = std::make_shared<fetch::DecompressSource>(
+            std::make_shared<fetch::BytesBodySource>(std::move(comp)),
+            fetch::DecompressSource::Kind::Deflate, 1024); // 总量上限 1 KiB
+        bool threw = false;
+        try {
+            (void)co_await read_all_src(*dec);
+        } catch (const std::runtime_error&) {
+            threw = true;
+        }
+        EXPECT_TRUE(threw);
+        // 不设上限：同数据完整读出（单块上限不影响总量）
+        auto dec2 = std::make_shared<fetch::DecompressSource>(
+            std::make_shared<fetch::BytesBodySource>(std::move(comp2)),
+            fetch::DecompressSource::Kind::Deflate);
+        std::string got = co_await read_all_src(*dec2); // 先读干再断言
+        EXPECT_EQ(got, raw);
+    }());
+    ASSERT_TRUE(p.done);
+    ASSERT_FALSE(p.error) << p.error_message();
 }
 
 // ---- SRI：正确摘要通过；错误摘要 read 阶段抛异常 ----

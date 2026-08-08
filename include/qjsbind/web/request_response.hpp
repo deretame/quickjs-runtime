@@ -15,6 +15,7 @@
 #include <qjsbind/web/headers.hpp>
 #include <qjsbind/web/stream.hpp>
 #include <qjsbind/web/url.hpp>
+#include <fetch/url_check.hpp>
 
 #include <stdexec/execution.hpp>
 
@@ -324,7 +325,7 @@ struct RequestImpl {
         } else {
             throw_type_error(ctx, "Request: 缺少 input");
         }
-        check_url_ports(ctx, url); // fetch 规范 #port-blocking
+        check_url_ports(ctx, url); // fetch 规范 #port-blocking（核心清单下沉 fetch/url_check.hpp）
         headers.set_guard(HeadersImpl::Guard::Request);
         if (signal)
             signal = nullptr; // 拷贝 input 时不继承 signal（规范：signal 不复制）
@@ -457,35 +458,13 @@ struct RequestImpl {
     static std::string resolve_url(JSContext* ctx, const std::string& str);
 };
 
-// fetch 规范 #port-blocking：Request URL 的端口在列表内 → 构造时 TypeError
-inline bool is_blocked_port(int port) {
-    static const int kBad[] = {
-        0, 1, 7, 9, 11, 13, 15, 17, 19, 20, 21, 22, 23, 25, 37, 42, 43, 53, 69,
-        77, 79, 87, 95, 101, 102, 103, 104, 109, 110, 111, 113, 115, 117, 119,
-        123, 135, 137, 139, 143, 161, 179, 389, 427, 465, 512, 513, 514, 515,
-        526, 530, 531, 532, 540, 548, 554, 556, 563, 587, 601, 636, 989, 990,
-        993, 995, 1719, 1720, 1723, 2049, 3659, 4045, 4190, 5060, 5061, 6000,
-        6566, 6665, 6666, 6667, 6668, 6669, 6679, 6697, 10080,
-    };
-    for (int b : kBad)
-        if (port == b)
-            return true;
-    return false;
-}
-
-// 解析 URL 的端口并做 blocked 检查（绝对 URL 字符串）
+// fetch 规范 #port-blocking：Request URL 的端口在列表内 → 构造时 TypeError。
+// 清单与检查逻辑已下沉到核心层（fetch/url_check.hpp），此处仅做异常适配。
 inline void check_url_ports(JSContext* ctx, const std::string& url) {
-    auto r = boost::urls::parse_uri_reference(url);
-    if (r.has_error())
-        return; // 解析失败由 URL 层抛
-    if (r->has_port()) {
-        try {
-            const int p = std::stoi(std::string(r->port()));
-            if (is_blocked_port(p))
-                throw_type_error(ctx, "Request: URL 端口 %d 被禁止", p);
-        } catch (const std::invalid_argument&) {
-            return;
-        }
+    try {
+        fetch::check_url_ports(url);
+    } catch (const fetch::Error& e) {
+        throw_type_error(ctx, "Request: %s", e.what());
     }
 }
 

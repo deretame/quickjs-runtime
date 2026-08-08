@@ -16,13 +16,13 @@
 #include <boost/url/parse.hpp>
 #include <exec/asio/use_sender.hpp>
 
+#include <algorithm>
 #include <functional>
 #include <memory>
 #include <optional>
 #include <stdexcept>
 #include <tuple>
 
-#include <algorithm>
 #include <cctype>
 #include <cstring>
 

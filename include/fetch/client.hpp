@@ -43,30 +43,31 @@ namespace fetch {
 inline std::string resolve_url(const std::string& loc, const std::string& base)
 {
     auto normalize_url = [](boost::urls::url& u) {
-        // scheme 小写化（HTTP:// → http://）
-        if (u.has_scheme() && !u.scheme().empty()) {
+        // WHATWG 归一（v1 UrlImpl::parse 对齐）：scheme/host 小写化 +
+        // 默认端口剥离。host 用 set_encoded_host（已编码语义）——实测
+        // set_host 会把 %41 二次编码为 %2541（未编码语义），encoded 版保留。
+        if (u.has_scheme()) {
             std::string s(u.scheme());
             for (auto& c : s)
                 c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
             u.set_scheme(s);
         }
-        // host 小写化：用 encoded_host()（保留 percent-escape，避免解码文本
-        // 经 set_host 被误解析为 IP-literal 而抛异常）；IPv6 文字地址
-        // （含冒号/方括号）跳过；set_host 失败忽略（host 来自语法解析）。
         std::string host(u.encoded_host());
         if (!host.empty() && host.find(':') == std::string::npos) {
             for (auto& c : host)
                 c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-            (void)u.set_host(host);
+            u.set_encoded_host(host); // %XX 保留；hex 字母小写化语义不变
         }
-        // 默认端口剥离：仅 http/https（WHATWG 语义），数值比较（前导零 080 == 80）
+        // 默认端口剥离（WHATWG 默认端口表 http:80/https:443/ws:80/wss:443），
+        // 数值比较（前导零 080 == 80）
         if (u.has_port() && u.has_scheme()) {
             const std::string s(u.scheme());
-            if (s == "http" || s == "https") {
+            bool known = s == "http" || s == "https" || s == "ws" || s == "wss";
+            if (known) {
                 std::string p(u.port());
                 while (p.size() > 1 && p[0] == '0')
                     p.erase(p.begin());
-                const std::string def = s == "https" ? "443" : "80";
+                const std::string def = (s == "https" || s == "wss") ? "443" : "80";
                 if (p == def)
                     u.remove_port();
             }

@@ -214,6 +214,29 @@ TEST(FetchcoreDirect, RedirectSchemeCase)
     ASSERT_FALSE(p.error) << p.error_message();
 }
 
+// resolve_url 归一单测（review sa_20260808_171142：encoded host 保留、
+// 前导零端口剥离、非 http/https 不剥离、IPv6 不抛）
+TEST(FetchcoreDirect, ResolveUrlNormalization)
+{
+    // encoded host 不二次编码（%41 = 'A' 保留；round-trip 无二次 escape）
+    EXPECT_EQ(fetch::resolve_url("http://%41.example/x", "http://base/"),
+              "http://%41.example/x");
+    // 前导零默认端口剥离（080 == 80，WHATWG 数值语义）
+    EXPECT_EQ(fetch::resolve_url("http://h:080/x", "http://base/"),
+              "http://h/x");
+    // 非默认端口保留；ws://h:80 是 ws 的默认端口（WHATWG 默认端口表）→ 剥离
+    EXPECT_EQ(fetch::resolve_url("http://h:8080/x", "http://base/"),
+              "http://h:8080/x");
+    EXPECT_EQ(fetch::resolve_url("ws://h:80/x", "http://base/"),
+              "ws://h/x");
+    // IPv6 文字地址：host 跳过小写化、不抛异常
+    EXPECT_EQ(fetch::resolve_url("http://[::1]:8080/x", "http://base/"),
+              "http://[::1]:8080/x");
+    // host 小写化（普通域名）
+    EXPECT_EQ(fetch::resolve_url("http://ExAmPle.COM/x", "http://base/"),
+              "http://example.com/x");
+}
+
 TEST(FetchcoreDirect, RedirectErrorMode)
 {
     wpt::WptTestServer server("third_party/wpt");

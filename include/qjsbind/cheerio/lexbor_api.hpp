@@ -1832,6 +1832,8 @@ inline void install_cheerio_fast(qjs::Context& ctx)
                         JS_FreeValue(jctx, arr);
                     }
                     DomRef* ref = parse_document(jctx, "");
+                    if (!ref)
+                        return JS_EXCEPTION;
                     std::vector<lxb_dom_node_t*> nodes;
                     for (uint32_t i = 0; i < len; ++i) {
                         JSValue v = JS_GetPropertyUint32(jctx, argv[0], i);
@@ -1850,6 +1852,8 @@ inline void install_cheerio_fast(qjs::Context& ctx)
             if (s)
                 JS_FreeCString(jctx, s);
             DomRef* ref = parse_document(jctx, html);
+            if (!ref)
+                return JS_EXCEPTION;
             std::vector<lxb_dom_node_t*> nodes;
             nodes.push_back(&ref->doc->dom_document.node);
             return make_sel(jctx, ref, std::move(nodes));
@@ -1875,6 +1879,8 @@ inline void install_cheerio_fast(qjs::Context& ctx)
     ctx.globals().set("__lxb_load", qjs::func(jctx, [](qjs::Ctx c, std::string html) -> qjs::Value {
         JSContext* jctx = c.ctx;
         DomRef* ref = parse_document(jctx, html);
+        if (!ref)
+            return qjs::Value(jctx, JS_EXCEPTION);
         std::vector<lxb_dom_node_t*> nodes;
         nodes.push_back(&ref->doc->dom_document.node);
         return qjs::Value(jctx, make_sel(jctx, ref, std::move(nodes)));

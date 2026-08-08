@@ -435,7 +435,7 @@ inline JSValue sel_call_ex(JSContext* ctx, JSValueConst func_obj,
         return make_sel(ctx, h->ref, {h->node});
     }
     // $(array of handles)：包装
-    if (JS_IsArray(argv[0])) {
+    if (argc >= 1 && JS_IsArray(argv[0])) {
         JSValue arr = JS_GetPropertyStr(ctx, argv[0], "length");
         uint32_t len = 0;
         if (!JS_IsException(arr)) {
@@ -510,13 +510,19 @@ inline JSValue sel_get_property_ex(JSContext* ctx, JSValueConst obj,
             if (numeric) {
                 auto* s = (CheerioSel*)JS_GetOpaque(
                     obj, class_ids(JS_GetRuntime(ctx)).sel);
+                JSValue r = JS_UNDEFINED;
                 if (s) {
                     long idx = strtol(name, nullptr, 10);
                     if (idx >= 0 && (size_t)idx < s->nodes.size())
-                        return make_node(ctx, s->nodes[(size_t)idx], s->ref);
+                        r = make_node(ctx, s->nodes[(size_t)idx], s->ref);
                 }
+                JS_FreeCString(ctx, name);
+                if (!JS_IsUndefined(r))
+                    return r;
+                // 越界索引：继续走 own/原型链（undefined）
+            } else {
+                JS_FreeCString(ctx, name);
             }
-            JS_FreeCString(ctx, name);
         }
     }
     // own property（prevObject 等经 set_property/DefineProperty 写入的
@@ -660,16 +666,21 @@ inline void register_classes(JSRuntime* rt, JSContext* ctx)
 // ---------------------------------------------------------------------------
 // 文档解析入口
 // ---------------------------------------------------------------------------
+// 失败时设置 JS 异常并返回 nullptr（不抛 C++ 异常——调用方可能是裸
+// JS_NewCFunction 回调，C++ 异常穿 C 边界是 UB）
 inline DomRef* parse_document(JSContext* ctx, const std::string& html)
 {
     lxb_html_document_t* doc = lxb_html_document_create();
-    if (!doc)
-        qjs::throw_type_error(ctx, "lexbor: document create failed");
+    if (!doc) {
+        JS_ThrowTypeError(ctx, "lexbor: document create failed");
+        return nullptr;
+    }
     lxb_status_t st =
         lxb_html_document_parse(doc, (const lxb_char_t*)html.data(), html.size());
     if (st != LXB_STATUS_OK) {
         lxb_html_document_destroy(doc);
-        qjs::throw_type_error(ctx, "lexbor: html parse failed");
+        JS_ThrowTypeError(ctx, "lexbor: html parse failed");
+        return nullptr;
     }
     return new DomRef{doc, 0};
 }

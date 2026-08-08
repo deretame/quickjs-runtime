@@ -28,6 +28,7 @@ FILES = [
     "include/qjsbind/web/web.hpp",
     "src/fetch/beast_transport.cpp",
     "src/fetch/socks5.cpp",
+    "src/fetch/socks5.hpp",
     "tests/fetch_test.cpp",
     "tests/fetchcore_test.cpp",
 ]

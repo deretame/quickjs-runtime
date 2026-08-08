@@ -50,20 +50,26 @@ inline std::string resolve_url(const std::string& loc, const std::string& base)
                 c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
             u.set_scheme(s);
         }
-        // host 小写化：IPv6 文字地址（含冒号/方括号）跳过；set_host 失败忽略
-        //（host 来自 boost 语法解析，理论不会失败）
-        std::string host(u.host());
+        // host 小写化：用 encoded_host()（保留 percent-escape，避免解码文本
+        // 经 set_host 被误解析为 IP-literal 而抛异常）；IPv6 文字地址
+        // （含冒号/方括号）跳过；set_host 失败忽略（host 来自语法解析）。
+        std::string host(u.encoded_host());
         if (!host.empty() && host.find(':') == std::string::npos) {
             for (auto& c : host)
                 c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
             (void)u.set_host(host);
         }
-        // 默认端口剥离（http:80 / https:443）
-        if (u.has_port()) {
-            const bool is_https = u.scheme() == "https";
-            const std::string p(u.port());
-            if ((!is_https && p == "80") || (is_https && p == "443"))
-                u.remove_port();
+        // 默认端口剥离：仅 http/https（WHATWG 语义），数值比较（前导零 080 == 80）
+        if (u.has_port() && u.has_scheme()) {
+            const std::string s(u.scheme());
+            if (s == "http" || s == "https") {
+                std::string p(u.port());
+                while (p.size() > 1 && p[0] == '0')
+                    p.erase(p.begin());
+                const std::string def = s == "https" ? "443" : "80";
+                if (p == def)
+                    u.remove_port();
+            }
         }
     };
 

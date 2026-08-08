@@ -22,6 +22,8 @@
 #include <exec/asio/use_sender.hpp>
 #include <stdexec/execution.hpp>
 
+#include <fetch/scheduler.hpp>
+
 #include <quickjs.h>
 
 #include <qjsbind/error.hpp>
@@ -36,23 +38,10 @@ class Runtime; // 前向声明（class_registry::finalizer 反查用）
 // 再绑定一次（幂等）并恢复。协程异步函数可用 current_io() 拿事件循环（§11）。
 inline thread_local Runtime* tls_current_runtime = nullptr;
 
-// ---- io_context_scheduler：把 asio::io_context 包成 stdexec scheduler ----
-// schedule() = post(ioc, exec::asio::use_sender)（用法文档 §12.6.2）
-class io_context_scheduler {
-public:
-    using scheduler_concept = stdexec::scheduler_tag;
-    explicit io_context_scheduler(boost::asio::io_context& ioc) noexcept : ioc_(&ioc) {}
-
-    stdexec::sender auto schedule() const noexcept
-    {
-        return exec::asio::asio_impl::post(*ioc_, exec::asio::use_sender);
-    }
-
-    bool operator==(const io_context_scheduler&) const noexcept = default;
-
-private:
-    boost::asio::io_context* ioc_;
-};
+// ---- io_context_scheduler：复用 fetchcore 的 fetch::io_scheduler ----
+// （fetch_cpp_decoupling.md §7-8 风险 8：核心库自带一份，绑定层不重复实现，
+// 避免两份实现漂移；schedule() = post(ioc, exec::asio::use_sender)）
+using io_context_scheduler = fetch::io_scheduler;
 
 // ---- 实例 id：自定义或自动 UUID v4（boost::uuids）----
 inline std::string make_uuid_v4()

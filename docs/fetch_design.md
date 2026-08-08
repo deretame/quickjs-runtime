@@ -2,6 +2,11 @@
 
 > 状态：实现完成（2026-08-07），wpt 精选子集 30/30 文件全过（510 pass / 0 fail / 9 expected）
 > 进度台账：`docs/fetch_milestone_progress.md`；已知问题：`docs/known_issues.md` KI-050~055
+> **v3 迁移（2026-08-08）**：fetch 核心已解耦为独立纯 C++ 库 `fetchcore`
+> （`include/fetch/` + `src/fetch/`，namespace `fetch`；`fetch::Client` 注入 io_context，
+> redirect/SRI/data:/中间件链全部下沉；绑定层 `install_web_apis(ctx, fetch::Client&)` 变薄，
+> 中间件注册入口只有 `fetch::Client::use()`，不向 JS 暴露）。
+> 本文件 v1 分层图为迁移前结构，作历史参照；v3 目标架构见 `docs/fetch_cpp_decoupling.md` §3。
 
 ## 1. 架构总览
 

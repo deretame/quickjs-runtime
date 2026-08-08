@@ -64,6 +64,8 @@ inline std::map<std::string, std::string> parse_query(std::string_view q) {
                 key.clear();
                 val.clear();
                 in_key = true;
+            } else {
+                val.push_back(c); // 值内的 '='：保留（如 location=/status.py?code=200）
             }
             continue;
         }
@@ -239,14 +241,15 @@ private:
                 res.set(http::field::access_control_allow_origin, "*");
             if (query.count("location")) {
                 std::string loc = query.at("location");
-                // wpt 语义：无 simple 参数时附加原 query 参数 + count（模拟 stash 计数）
+                // wpt 语义：无 simple 参数时保留全部原 query 参数 + count（模拟 stash 计数）
+                // 注意：与 wpt 原版 redirect.py 一致——location 参数本身也保留，
+                // 使无限重定向循环成立（每次 Location 都带 location=/redirect.py）。
                 if (!query.count("simple")) {
                     std::string suffix;
                     for (const auto& [k, v] : query)
-                        if (k != "location")
-                            suffix += (suffix.empty() ? (loc.find('?') != std::string::npos ? "&" : "?")
-                                                      : "&") +
-                                      url_encode(k) + "=" + url_encode(v);
+                        suffix += (suffix.empty() ? (loc.find('?') != std::string::npos ? "&" : "?")
+                                                  : "&") +
+                                  url_encode(k) + "=" + url_encode(v);
                     loc += suffix + (suffix.empty() ? (loc.find('?') != std::string::npos ? "&" : "?")
                                                     : "&") +
                             "count=" + std::to_string(++redirect_count_);
@@ -310,6 +313,7 @@ private:
             res.set("X-Request-Method", std::string(req.method_string()));
             res.set("X-Request-Content-Length", header_or(req, http::field::content_length, "NO"));
             res.set("X-Request-Content-Type", header_or(req, http::field::content_type, "NO"));
+            res.set("X-Request-Authorization", header_or(req, http::field::authorization, "NO"));
             res.set(http::field::content_type, "text/plain");
             res.body() = req.body();
             return;

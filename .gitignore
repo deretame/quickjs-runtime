@@ -39,6 +39,6 @@ NUL.obj
 *.tmp
 
 # 构建产物
-src/net/cacert_embedded.hpp
+src/fetch/cacert_embedded.hpp
 third_party/wpt/
 .clice

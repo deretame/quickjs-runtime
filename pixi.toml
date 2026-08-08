@@ -13,7 +13,7 @@ ninja = ">=1.12"
 [tasks]
 # 克隆并 bootstrap vcpkg 到 third_party/vcpkg
 setup-vcpkg = "python scripts/bootstrap_vcpkg.py"
-# 下载 Mozilla CA bundle 生成嵌入头文件 src/net/cacert_embedded.hpp
+# 下载 Mozilla CA bundle 生成嵌入头文件 src/fetch/cacert_embedded.hpp
 fetch-cacert = "python scripts/bootstrap_cacert.py"
 # 配置 CMake（MSVC + vcpkg toolchain + Ninja）
 configure = { cmd = "python scripts/configure.py", depends-on = ["setup-vcpkg", "fetch-cacert"] }

@@ -17,7 +17,7 @@
 // 不读完的 body 连接被丢弃）。挂起中的 read() 任务持 shared_ptr 副本，对象存活。
 #pragma once
 
-#include <qjsbind/web/net.hpp>
+#include <fetch/body.hpp>
 #include <qjsbind/std_exec.hpp>
 
 #include <qjsbind/qjsbind.hpp>
@@ -32,6 +32,10 @@
 #include <utility>
 
 namespace qjsbind::web {
+
+// 底层字节源 = fetchcore 核心类型（fetch_cpp_decoupling.md：绑定层不再持有
+// 独立的 BodySource，BodySource/Header/Request/Response 均为 fetch 核心类型）
+using BodySource = fetch::BodySource;
 
 // ---- 挂起等待者（协程合成帧句柄双向链表，FIFO 结算）----
 // 用法：read() 协程局部声明，co_await 挂起；head_slot/tail_slot 指向所属

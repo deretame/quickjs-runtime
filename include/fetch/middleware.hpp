@@ -1,22 +1,27 @@
-// qjsbind::web —— fetch 拦截器框架 + 自动解压（设计文档 §5，v2 M3）
+// fetchcore —— C++ 中间件框架 + 内建中间件（原 qjsbind::web/interceptor.hpp 迁入）
 //
-// 拦截器是 around 模型的协程链：每个拦截器收到内层 next，co_await next 之前是
-// 前置相位、之后是后置相位。选 around 而非平面管线的动因是传输选路与重试——
-// 包裹式控制流（设计文档 §5.1/§8 决策记录 6）。
+// 中间件是 around 模型的协程链：每个中间件收到内层 next，co_await next 之前是
+// 前置相位、之后是后置相位（设计文档 fetch_design.md §5）。
 //
 // 注册顺序 = 嵌套顺序（洋葱）：先注册者在最外层——前置相位按注册顺序进入，
 // 后置相位逆序返回；read 路径上外层 source 先执行（解压在最外层）。
 //
-// AcceptEncodingInterceptor：自动加 Accept-Encoding: gzip, deflate, br；
-// 响应命中 content-encoding → 剥头 + 包 DecompressSource（§5.6）。
-// DecompressSource：gzip（inflateInit2(15+16)）/ deflate（zlib 流，首个块
-// Z_DATA_ERROR 时回退裸 deflate）/ br（BrotliDecoderDecompressStream）（§5.8）。
+// 边界：中间件注册入口只有 fetch::Client::use()（C++ API），不向 JS 暴露
+// 任何注册/枚举/移除能力（docs/fetch_cpp_decoupling.md §5）。
+//
+// 内建清单：
+//   AcceptEncodingMiddleware：自动加 Accept-Encoding: gzip, deflate, br；
+//     响应命中 content-encoding → 剥头 + 包 DecompressSource。
+//   DecompressSource：gzip（inflateInit2(15+16)）/ deflate（zlib 流，首个块
+//     Z_DATA_ERROR 时回退裸 deflate）/ br（BrotliDecoderDecompressStream）。
+//   IntegritySource：SRI 末端校验（摘要对解码后字节；read 时增量算，EOF 比对）。
+//   Socks5ProxyMiddleware：SOCKS5 选路（Route 回调；命中 → 直接走传输隧道，
+//     不调 next；未命中 → 直连）。面向 Transport 抽象，不依赖具体实现。
 #pragma once
 
-#include <qjsbind/web/net.hpp>
-#include <qjsbind/std_exec.hpp>
-
-#include <net/http_backend.hpp>
+#include <fetch/task.hpp>
+#include <fetch/types.hpp>
+#include <fetch/transport.hpp>
 
 #include <brotli/decode.h>
 #include <openssl/evp.h>
@@ -32,88 +37,47 @@
 #include <utility>
 #include <vector>
 
-namespace qjsbind::web {
+namespace fetch {
 
-// 链尾处理器：最终落到 FetchBackend::request（fetch_impl 组装，§5.4）
-using FetchHandler =
-    std::function<std_exec::task<HttpResponse>(const HttpRequest& req, std::stop_token st)>;
+// 链尾处理器：最终落到 Transport::request（Client 组装，每跳重走全链）
+using Handler =
+    std::function<std_exec::task<Response>(const Request& req, std::stop_token st)>;
 
-struct FetchInterceptor {
-    virtual ~FetchInterceptor() = default;
+struct Middleware {
+    virtual ~Middleware() = default;
     // co_await next 之前 = 前置相位；之后 = 后置相位。
     // req 为 const 引用、贯穿整个调用：后置相位仍可读。
     // 短路 = 不调 next 直接 co_return；重试 = 多次调 next；换传输 = 调别的 handler。
-    virtual std_exec::task<HttpResponse> intercept(const HttpRequest& req, std::stop_token st,
-                                               FetchHandler next) = 0;
+    virtual std_exec::task<Response> intercept(const Request& req, std::stop_token st,
+                                               Handler next) = 0;
 };
 
-// 链组装（§5.4）：链尾 = backend，逐层包拦截器；handler 可重入（next 拷贝传递）
-inline FetchHandler make_chain(
-    const std::vector<std::shared_ptr<FetchInterceptor>>& interceptors,
-    const std::shared_ptr<FetchBackend>& backend)
+// 链组装：链尾 = transport，逐层包中间件；handler 可重入（next 拷贝传递）
+inline Handler make_chain(const std::vector<std::shared_ptr<Middleware>>& middlewares,
+                          const std::shared_ptr<Transport>& transport)
 {
-    FetchHandler h = [backend](const HttpRequest& req, std::stop_token st) {
-        return backend->request(req, std::move(st));
+    Handler h = [transport](const Request& req, std::stop_token st) {
+        return transport->request(req, std::move(st));
     };
-    for (auto it = interceptors.rbegin(); it != interceptors.rend(); ++it) {
-        std::shared_ptr<FetchInterceptor> interceptor = *it;
-        FetchHandler next = std::move(h);
-        h = [interceptor, next](const HttpRequest& req, std::stop_token st) {
-            return interceptor->intercept(req, std::move(st), next); // next 拷贝：可重入
+    for (auto it = middlewares.rbegin(); it != middlewares.rend(); ++it) {
+        std::shared_ptr<Middleware> mw = *it;
+        Handler next = std::move(h);
+        h = [mw, next](const Request& req, std::stop_token st) {
+            return mw->intercept(req, std::move(st), next); // next 拷贝：可重入
         };
     }
     return h;
 }
 
-// ---- 小工具（headers 查询/剥除）----
-inline bool has_header(const std::vector<Header>& headers, std::string_view name)
+// 单层包裹（Client 组装内建 Accept-Encoding 用）
+inline Handler wrap_middleware(const std::shared_ptr<Middleware>& mw, Handler next)
 {
-    for (const auto& h : headers)
-        if (h.name.size() == name.size() &&
-            std::equal(h.name.begin(), h.name.end(), name.begin(),
-                       [](char a, char b) { return (a | 32) == (b | 32); }))
-            return true;
-    return false;
+    return [mw, next = std::move(next)](const Request& req, std::stop_token st) {
+        return mw->intercept(req, std::move(st), next);
+    };
 }
 
-inline void strip_headers(std::vector<Header>& headers, std::initializer_list<const char*> names)
-{
-    headers.erase(std::remove_if(headers.begin(), headers.end(), [&](const Header& h) {
-                      for (const char* n : names)
-                          if (h.name.size() == std::strlen(n) &&
-                              std::equal(h.name.begin(), h.name.end(), n,
-                                         [](char a, char b) { return (a | 32) == (b | 32); }))
-                              return true;
-                      return false;
-                  }),
-                  headers.end());
-}
-
-// 取单一 content-encoding（逗号多个 → nullopt；identity/无 → nullopt）
-inline std::optional<std::string> single_content_encoding(const std::vector<Header>& headers)
-{
-    for (const auto& h : headers) {
-        if (h.name.size() == 16 &&
-            std::equal(h.name.begin(), h.name.end(), "content-encoding",
-                       [](char a, char b) { return (a | 32) == (b | 32); })) {
-            const std::string& v = h.value;
-            if (v.find(',') != std::string::npos)
-                return std::nullopt; // 多编码：不处理透传（避免歧义）
-            std::string enc = v;
-            // 去空白/小写
-            enc.erase(std::remove_if(enc.begin(), enc.end(), [](char c) { return c == ' '; }),
-                      enc.end());
-            std::transform(enc.begin(), enc.end(), enc.begin(),
-                           [](char c) { return static_cast<char>(c | 32); });
-            if (enc.empty() || enc == "identity")
-                return std::nullopt;
-            return enc;
-        }
-    }
-    return std::nullopt;
-}
-
-// ---- DecompressSource：解码 body 流（设计文档 §5.8）----
+// ---- DecompressSource：解码 body 流（fetch_design.md §5.8）----
 // gzip：inflateInit2(15+16)；deflate：zlib 流（15），首个块 Z_DATA_ERROR 时回退裸
 // deflate（-15）；br：BrotliDecoderDecompressStream。解码错误/流截断 → 抛
 // std::runtime_error → read() reject TypeError（沿网络错误同一路径）。
@@ -216,7 +180,7 @@ private:
             if (rc == Z_STREAM_ERROR)
                 return false;
             if (rc == Z_NEED_DICT || (rc == Z_DATA_ERROR && z_.msg && std::strstr(z_.msg, "incorrect header check"))) {
-                // 裸 deflate 回退：zlib 流首个块头错误 → 用 -15 重试（设计文档 §5.8）
+                // 裸 deflate 回退：zlib 流首个块头错误 → 用 -15 重试（fetch_design.md §5.8）
                 if (fallback_ && !fallback_tried_) {
                     fallback_tried_ = true;
                     inflateEnd(&z_);
@@ -315,20 +279,20 @@ private:
     BrotliDecoderState* br_state_ = nullptr;
 };
 
-// ---- AcceptEncodingInterceptor（设计文档 §5.6）----
-class AcceptEncodingInterceptor : public FetchInterceptor {
+// ---- AcceptEncodingMiddleware（fetch_design.md §5.6）----
+class AcceptEncodingMiddleware : public Middleware {
 public:
-    std_exec::task<HttpResponse> intercept(const HttpRequest& req, std::stop_token st,
-                                       FetchHandler next) override
+    std_exec::task<Response> intercept(const Request& req, std::stop_token st,
+                                       Handler next) override
     {
         // ---- 前置相位 ----
         // 无 accept-encoding 且无 range（压缩使 Range 偏移失效）才自动加头；
         // 用户自己设了 accept-encoding → 原样透传不解压（undici 语义）
         const bool auto_added = !has_header(req.headers, "accept-encoding") &&
                                 !has_header(req.headers, "range");
-        HttpResponse resp;
+        Response resp;
         if (auto_added) {
-            HttpRequest r = req; // req 只读：拷贝后改
+            Request r = req; // req 只读：拷贝后改
             r.headers.push_back({"Accept-Encoding", "gzip, deflate, br"});
             resp = co_await next(r, st);
         } else {
@@ -356,7 +320,7 @@ public:
     }
 };
 
-// ---- IntegritySource：SRI 末端校验（设计文档 §4.5）----
+// ---- IntegritySource：SRI 末端校验（fetch_design.md §4.5）----
 // 包在解码层之外（摘要对解码后字节）；read 时增量算摘要，EOF 比对。
 // 不匹配 → 抛 std::runtime_error → 消费 reject TypeError（getReader 路径流进 Errored）。
 class IntegritySource : public BodySource {
@@ -401,8 +365,8 @@ public:
             unsigned int len = 0;
             if (EVP_DigestFinal_ex(mdctx_, digest, &len) != 1)
                 throw std::runtime_error("integrity: 摘要计算失败");
-            std::string b64 = base64_encode(digest, len);
-            // url-safe 变体归一化（-_ → +/）+ 去 padding（与 fetch_detail::digest_matches 一致）
+            std::string b64 = base64_encode_raw(digest, len);
+            // url-safe 变体归一化（-_ → +/）+ 去 padding（与 digest_matches 一致）
             if (norm_b64(b64) != norm_b64(digest_b64_))
                 throw std::runtime_error("integrity: 摘要不匹配（SRI 校验失败）");
             co_return std::nullopt;
@@ -427,7 +391,7 @@ private:
         return s;
     }
 
-    static std::string base64_encode(const unsigned char* data, size_t len)
+    static std::string base64_encode_raw(const unsigned char* data, size_t len)
     {
         static const char* tbl = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
                                  "0123456789+/";
@@ -452,31 +416,31 @@ private:
     EVP_MD_CTX* mdctx_ = nullptr;
 };
 
-// ---- Socks5ProxyInterceptor：SOCKS5 代理选路（设计文档 §5.7）----
-// 机制（握手/隧道）在 net 层（socks5_connect + http_request 代理参数），
-// 拦截器只做策略（route_：url → optional<Socks5Proxy>，空 = 直连）与选路。
-// 命中 → 调 backend_->request_via_socks5（不调 next，整条交换走隧道）；
-// 未命中 → co_await next（直连）。注册在最末（最贴近后端）：
-// 不调 next 意味着其内层只剩链尾 backend。
-class Socks5ProxyInterceptor : public FetchInterceptor {
+// ---- Socks5ProxyMiddleware：SOCKS5 代理选路（fetch_design.md §5.7）----
+// 机制（握手/隧道）在传输层（socks5_connect + BeastTransport 代理参数），
+// 中间件只做策略（route_：url → optional<Socks5Proxy>，空 = 直连）与选路。
+// 命中 → 调 transport_->request_via_socks5（不调 next，整条交换走隧道）；
+// 未命中 → co_await next（直连）。面向 Transport 抽象 + Route 回调——
+// 不依赖具体传输实现（解耦 SOCKS5 策略与 beast，见 fetch_cpp_decoupling.md §7-5）。
+class Socks5ProxyMiddleware : public Middleware {
 public:
     using Route =
-        std::function<std::optional<net::Socks5Proxy>(const std::string& url)>;
+        std::function<std::optional<Socks5Proxy>(const std::string& url)>;
 
-    Socks5ProxyInterceptor(std::shared_ptr<net::BeastFetchBackend> backend, Route route)
-        : backend_(std::move(backend)), route_(std::move(route)) {}
+    Socks5ProxyMiddleware(std::shared_ptr<Transport> transport, Route route)
+        : transport_(std::move(transport)), route_(std::move(route)) {}
 
-    std_exec::task<HttpResponse> intercept(const HttpRequest& req, std::stop_token st,
-                                       FetchHandler next) override
+    std_exec::task<Response> intercept(const Request& req, std::stop_token st,
+                                       Handler next) override
     {
         if (auto proxy = route_(req.url))
-            co_return co_await backend_->request_via_socks5(req, *proxy, st);
+            co_return co_await transport_->request_via_socks5(req, *proxy, st);
         co_return co_await next(req, st);
     }
 
 private:
-    std::shared_ptr<net::BeastFetchBackend> backend_;
+    std::shared_ptr<Transport> transport_;
     Route route_;
 };
 
-} // namespace qjsbind::web
+} // namespace fetch

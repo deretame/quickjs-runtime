@@ -1,6 +1,6 @@
 // SOCKS5 握手实现（RFC 1928 + RFC 1929 子协商）
 #include "socks5.hpp"
-#include <qjsbind/std_exec.hpp>
+#include <fetch/task.hpp>
 
 #include <boost/asio.hpp>
 #include <exec/asio/use_sender.hpp>
@@ -8,7 +8,7 @@
 #include <functional>
 #include <stdexcept>
 
-namespace qjsbind::net {
+namespace fetch {
 
 namespace {
 
@@ -182,4 +182,4 @@ socks5_connect(boost::asio::io_context& io, const Socks5Proxy& proxy,
     co_return sock;
 }
 
-} // namespace qjsbind::net
+} // namespace fetch

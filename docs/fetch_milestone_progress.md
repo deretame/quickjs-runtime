@@ -2,6 +2,34 @@
 
 > 状态：✅ 已完成 · 收尾时间：2026-08-07
 > 说明：本文件是工作进度台账；设计文档见 `docs/fetch_design.md`。
+> **v3 迁移（2026-08-08）**：fetch 核心解耦为独立纯 C++ 库 `fetchcore`
+> （`include/fetch/` + `src/fetch/`，namespace `fetch`），详见
+> `docs/fetch_cpp_decoupling.md`；本文件 v1/v2 条目保留作历史记录。
+
+## v3（2026-08-08）：fetchcore 核心解耦（fetch_cpp_decoupling.md 实施）
+
+- 新增 `fetchcore` 静态库（`src/fetch/beast_transport.cpp` + `socks5.cpp`）：只依赖
+  asio/beast/OpenSSL/zlib/brotli/stdexec，**不 include/不链接任何 quickjs/qjsbind**
+- 新增 `include/fetch/`：`task.hpp`（stdexec 别名）/ `error.hpp`（可拷贝 fetch::Error）/
+  `types.hpp`（Request/Response/Headers/Options/TlsOptions + 头操作/重定向判定/data: URL/
+  SRI 工具）/ `body.hpp`（BodySource + read_all）/ `transport.hpp`（Transport + Socks5Proxy）/
+  `middleware.hpp`（Handler/Middleware/链组装 + 解压/SRI/SOCKS5 选路内建中间件）/
+  `scheduler.hpp`（io_scheduler）/ `beast_transport.hpp`（BeastTransport 声明）/
+  `client.hpp`（fetch::Client：redirect 循环 ≤20 跳 / SRI / data: / 中间件链 / 传输）
+- 删除：`include/qjsbind/web/net.hpp`（类型迁 fetchcore）、`interceptor.hpp`（中间件迁
+  fetchcore）、`src/net/`（→ `src/fetch/`，命名空间 `qjsbind::net` → `fetch`）、
+  `qjsbind_net` target、双类型桥接（net_request_from_web / web_response_from_net）
+- 绑定层变薄：`web/fetch.hpp` 只做 JS⇄fetch::Request/Response 适配；中间件注册入口
+  只有 `fetch::Client::use()`（C++ API，JS 不可见）；`install_web_apis(ctx, fetch::Client&)`
+- `qjsbind/context.hpp` 的 io_context_scheduler 改为复用 `fetch::io_scheduler`
+- `qjsbind/std_exec.hpp` 改为 `fetch/task.hpp` 转发；lexbor 依赖从 qjsbind_net 移回 tests
+- 新增 `tests/fetchcore_test.cpp`：纯 C++ 直连用例（不建 JSRuntime）——GET/POST、流式读、
+  重定向（follow/error/manual/超限）、解压（gzip/br）、SRI（匹配/不匹配/null body）、
+  data: URL、abort（body 读 stopped）、用户中间件（auth 头）、多实例共用 io、SOCKS5、
+  HTTPS（extra_trust_pem）
+- 测试服务器修正（对齐 wpt 原版）：parse_query 保留值内 `=`；redirect.py 无 simple 时
+  Location 保留全部原 query 参数（含 location，无限重定向成立）
+- 验证：ctest 145/145 绿；wpt 精选子集 878 pass / 0 fail（与基线一致）
 
 ## 一、已完成并验证
 

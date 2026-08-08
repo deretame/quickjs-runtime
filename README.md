@@ -52,11 +52,16 @@ pixi run build
 ├── pixi.toml               # pixi 环境与任务定义
 ├── vcpkg.json              # vcpkg 依赖清单
 ├── include/
-│   └── dart_cpp_bridge/    # 异步库（stream.hpp / channel.hpp / sleep.hpp）
-├── docs/                   # 使用指南（P2300 执行器模型）
+│   ├── dart_cpp_bridge/    # 异步库（stream.hpp / channel.hpp / sleep.hpp）
+│   └── fetch/              # fetchcore：独立纯 C++ fetch 核心库（无 quickjs/qjsbind 依赖）
+│       ├── client.hpp      # fetch::Client（注入 io_context；redirect/SRI/data:/中间件链）
+│       ├── types.hpp       # Request/Response/Headers/Options + 头与 SRI 工具
+│       ├── middleware.hpp  # C++ 中间件框架 + 内建（解压/SRI/SOCKS5 选路）
+│       └── ...             # transport/body/scheduler/beast_transport/task/error
+├── docs/                   # 使用指南（P2300 执行器模型 + fetch 设计）
 ├── scripts/                # Python 脚本（pixi run 调用）
 │   ├── bootstrap_vcpkg.py  # 克隆 + bootstrap vcpkg
-│   ├── bootstrap_cacert.py # 下载 Mozilla CA bundle（fetch 网络层证书）
+│   ├── bootstrap_cacert.py # 下载 Mozilla CA bundle（fetchcore 传输层证书）
 │   ├── add_bom.py          # 给 web 层头文件加 UTF-8 BOM（MSVC GBK 兼容）
 │   ├── analyze_wpt.py      # wpt 精选子集清单生成
 │   ├── vs_env.py           # 定位 MSVC 环境（vswhere + vcvars64）
@@ -65,8 +70,8 @@ pixi run build
 │   └── test.py             # ctest
 ├── src/
 │   ├── main.cpp            # 主程序（quickjs-ng + asio + stdexec demo）
-│   └── net/                # fetch 网络层（boost::beast + OpenSSL，静态库 qjsbind_net）
-└── tests/                  # gtest 测试（97 个用例 + wpt 精选子集运行器，656 pass / 0 fail / 6 expected）
+│   └── fetch/              # fetchcore 传输实现（beast_transport/socks5/cacert_embedded，静态库 fetchcore）
+└── tests/                  # gtest 测试（含 fetchcore 纯 C++ 直连用例 + wpt 精选子集运行器，878 pass / 0 fail）
 ```
 
 ## 依赖

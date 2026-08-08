@@ -31,21 +31,17 @@ add_library(dart_cpp_bridge INTERFACE)
 target_include_directories(dart_cpp_bridge INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(dart_cpp_bridge INTERFACE STDEXEC::stdexec)
 
-# ---- qjsbind：QuickJS-NG 的 C++ 自动绑定层（header-only）----
-add_library(qjsbind INTERFACE)
-target_include_directories(qjsbind INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(qjsbind INTERFACE qjs Boost::uuid Boost::url utf8cpp::utf8cpp)
-
-# ---- qjsbind_net：fetch 网络层（boost::beast + OpenSSL，静态库）----
-add_library(qjsbind_net STATIC src/net/http_client.cpp src/net/socks5.cpp)
+# ---- fetchcore：独立纯 C++ fetch 核心库（不 include/不链接任何 quickjs/qjsbind）----
+# 类型/Client/中间件 header-only（include/fetch/），传输实现在此静态库。
+add_library(fetchcore STATIC src/fetch/beast_transport.cpp src/fetch/socks5.cpp)
 if(MSVC)
-    target_compile_options(qjsbind_net PRIVATE /utf-8)
+    target_compile_options(fetchcore PRIVATE /utf-8)
 endif()
-target_include_directories(qjsbind_net PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
+target_include_directories(fetchcore PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
-target_link_libraries(qjsbind_net PUBLIC
+target_link_libraries(fetchcore PUBLIC
     Boost::asio
     Boost::url
     OpenSSL::SSL
@@ -54,15 +50,18 @@ target_link_libraries(qjsbind_net PUBLIC
     unofficial::brotli::brotlidec
     unofficial::brotli::brotlicommon
     STDEXEC::stdexec
-    lexbor::lexbor
 )
+
+# ---- qjsbind：QuickJS-NG 的 C++ 自动绑定层（header-only）----
+add_library(qjsbind INTERFACE)
+target_include_directories(qjsbind INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(qjsbind INTERFACE qjs Boost::uuid Boost::url utf8cpp::utf8cpp fetchcore)
 
 # ---- 主程序 ----
 add_executable(quickjs_runtime src/main.cpp)
 target_link_libraries(quickjs_runtime PRIVATE
     qjs
     qjsbind
-    qjsbind_net
     Boost::asio
     STDEXEC::stdexec
     fmt::fmt
@@ -81,6 +80,7 @@ add_executable(quickjs_runtime_tests
     tests/m3_binding_test.cpp
     tests/m4_binding_test.cpp
     tests/fetch_test.cpp
+    tests/fetchcore_test.cpp
     tests/wpt_runner.cpp
     tests/socks5_test.cpp
     tests/cheerio_bench_test.cpp
@@ -90,13 +90,14 @@ add_executable(quickjs_runtime_tests
 target_link_libraries(quickjs_runtime_tests PRIVATE
     qjs
     qjsbind
-    qjsbind_net
     STDEXEC::stdexec
     fmt::fmt
     dart_cpp_bridge
     GTest::gtest_main
+    Boost::asio
     unofficial::brotli::brotlienc
     ZLIB::ZLIB
+    lexbor::lexbor  # cheerio（BreezeHtml）用，不属网络层（fetch_cpp_decoupling.md §P4）
 )
 
 # Debug 构建 JS_CallInternal 栈帧 ~21KB：默认 1MB 线程栈下 ~48 层 JS 递归

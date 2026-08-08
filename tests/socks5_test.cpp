@@ -5,8 +5,10 @@
 #include <gtest/gtest.h>
 #include <qjsbind/qjsbind.hpp>
 #include <qjsbind/web/web.hpp>
-#include <net/http_backend.hpp>
+#include <fetch/client.hpp>
+#include <fetch/beast_transport.hpp>
 #include "socks5_server.hpp"
+#include "tls_echo_server.hpp"
 #include "wpt_server.hpp"
 
 #include <boost/asio/ssl.hpp>
@@ -25,7 +27,7 @@ namespace {
 struct Socks5Fixture : ::testing::Test {
     Runtime rt;
     Context ctx = rt.main_context();
-    std::shared_ptr<qjsbind::net::BeastFetchBackend> backend;
+    std::unique_ptr<fetch::Client> client;
     qjsbind::net::wpt::WptTestServer wpt{std::string("third_party/wpt")}; // 隧道目标（http）
     std::string base;
 
@@ -34,21 +36,22 @@ struct Socks5Fixture : ::testing::Test {
               std::optional<std::pair<std::string, std::string>> proxy_auth = std::nullopt,
               bool route_all = true, uint16_t proxy_port = 0)
     {
-        backend = std::make_shared<qjsbind::net::BeastFetchBackend>(rt.io());
+        auto transport = std::make_shared<fetch::BeastTransport>(rt.io());
+        client = std::make_unique<fetch::Client>(rt.io(), transport);
         base = wpt.base_url();
         proxy_ = std::make_shared<qjsbind::net::wpt::Socks5TestServer>(opt);
         proxy_->start();
         const uint16_t port = proxy_port ? proxy_port : proxy_->port();
-        const qjsbind::net::Socks5Proxy p{proxy_->host(), port, proxy_auth};
-        auto interceptor = std::make_shared<qjsbind::web::Socks5ProxyInterceptor>(
-            backend,
+        const fetch::Socks5Proxy p{proxy_->host(), port, proxy_auth};
+        client->use(std::make_shared<fetch::Socks5ProxyMiddleware>(
+            transport,
             [this, p, route_all](const std::string& url)
-                -> std::optional<qjsbind::net::Socks5Proxy> {
+                -> std::optional<fetch::Socks5Proxy> {
                 if (!route_all)
                     return std::nullopt; // 全直连
                 return p;
-            });
-        qjsbind::web::install_web_apis(ctx, backend, {interceptor});
+            }));
+        qjsbind::web::install_web_apis(ctx, *client);
     }
 
     std::shared_ptr<qjsbind::net::wpt::Socks5TestServer> proxy_;
@@ -87,12 +90,14 @@ TEST_F(Socks5Fixture, UserPass)
     qjsbind::net::wpt::Socks5TestServer::Options bad_opt = opt;
     auto bad = std::make_shared<qjsbind::net::wpt::Socks5TestServer>(bad_opt);
     bad->start();
-    qjsbind::net::Socks5Proxy badp{bad->host(), bad->port(),
-                                   std::make_pair(std::string("alice"), std::string("wrong"))};
-    auto interceptor = std::make_shared<qjsbind::web::Socks5ProxyInterceptor>(
-        backend, [badp](const std::string&) { return badp; });
+    fetch::Socks5Proxy badp{bad->host(), bad->port(),
+                            std::make_pair(std::string("alice"), std::string("wrong"))};
+    auto bad_transport = std::make_shared<fetch::BeastTransport>(rt.io());
+    fetch::Client bad_client{rt.io(), bad_transport};
+    bad_client.use(std::make_shared<fetch::Socks5ProxyMiddleware>(
+        bad_transport, [badp](const std::string&) { return badp; }));
     auto ctx2 = rt.main_context();
-    qjsbind::web::install_web_apis(ctx2, backend, {interceptor});
+    qjsbind::web::install_web_apis(ctx2, bad_client);
     Value r2 = ctx2.eval(
         "fetch('" + base + "/echo-content.py', {method: 'POST', body: 'x'})"
         ".then(() => { globalThis.__bad = 'no'; })"
@@ -154,19 +159,20 @@ TEST_F(Socks5Fixture, Routing)
 {
     qjsbind::net::wpt::Socks5TestServer::Options opt;
     opt.record_targets = true;
-    backend = std::make_shared<qjsbind::net::BeastFetchBackend>(rt.io());
+    auto transport = std::make_shared<fetch::BeastTransport>(rt.io());
+    client = std::make_unique<fetch::Client>(rt.io(), transport);
     base = wpt.base_url();
     proxy_ = std::make_shared<qjsbind::net::wpt::Socks5TestServer>(opt);
     proxy_->start();
-    const qjsbind::net::Socks5Proxy p{proxy_->host(), proxy_->port(), std::nullopt};
+    const fetch::Socks5Proxy p{proxy_->host(), proxy_->port(), std::nullopt};
     // 策略：仅 /via-proxy 路径走代理
-    auto interceptor = std::make_shared<qjsbind::web::Socks5ProxyInterceptor>(
-        backend, [p](const std::string& url) -> std::optional<qjsbind::net::Socks5Proxy> {
+    client->use(std::make_shared<fetch::Socks5ProxyMiddleware>(
+        transport, [p](const std::string& url) -> std::optional<fetch::Socks5Proxy> {
             return url.find("/via-proxy") != std::string::npos
-                       ? std::optional<qjsbind::net::Socks5Proxy>(p)
+                       ? std::optional<fetch::Socks5Proxy>(p)
                        : std::nullopt;
-        });
-    qjsbind::web::install_web_apis(ctx, backend, {interceptor});
+        }));
+    qjsbind::web::install_web_apis(ctx, *client);
     Value r = ctx.eval(
         "fetch('" + base + "/echo-content.py')" // 未命中 → 直连
         ".then(x => x.text()).then(t => { globalThis.__direct = t; });"
@@ -199,86 +205,6 @@ TEST_F(Socks5Fixture, AbortDuringHandshake)
     EXPECT_EQ(ctx.eval("__a").as<std::string>(), "AbortError");
 }
 
-// ---- https over tunnel：TLS 在 SOCKS5 隧道上照常握手（SNI/证书校验按目标 host）----
-namespace asio = boost::asio;
-namespace beast = boost::beast;
-namespace http = beast::http;
-using tcp = asio::ip::tcp;
-
-class TlsEchoServer {
-public:
-    TlsEchoServer()
-    {
-        // ctest 的 WORKING_DIRECTORY 是 build 目录 → 多路径尝试
-        std::string cert, key;
-        for (const char* p : {"tests/certs/", "../tests/certs/", "../../tests/certs/"}) {
-            std::ifstream f(std::string(p) + "server.crt");
-            if (f) {
-                cert = std::string(p) + "server.crt";
-                key = std::string(p) + "server.key";
-                break;
-            }
-        }
-        ctx_ = std::make_shared<asio::ssl::context>(asio::ssl::context::tls_server);
-        ctx_->use_certificate_chain_file(cert);
-        ctx_->use_private_key_file(key, asio::ssl::context::pem);
-        acceptor_ = tcp::acceptor(io_, tcp::endpoint(asio::ip::address_v4::loopback(), 0));
-        port_ = acceptor_.local_endpoint().port();
-        thread_ = std::thread([this] { run(); });
-    }
-    ~TlsEchoServer()
-    {
-        boost::system::error_code ec;
-        acceptor_.close(ec);
-        if (thread_.joinable())
-            thread_.join();
-    }
-    std::string base_url() const
-    {
-        return "https://127.0.0.1:" + std::to_string(port_);
-    }
-
-private:
-    void run()
-    {
-        for (;;) {
-            boost::system::error_code ec;
-            tcp::socket s = acceptor_.accept(ec);
-            if (ec)
-                break;
-            std::thread([this, s = std::move(s)]() mutable { handle(std::move(s)); })
-                .detach();
-        }
-    }
-    void handle(tcp::socket s)
-    {
-        try {
-            asio::ssl::stream<tcp::socket> stream(std::move(s), *ctx_);
-            boost::system::error_code ec;
-            stream.handshake(asio::ssl::stream_base::server, ec);
-            if (ec)
-                return;
-            beast::flat_buffer buf;
-            http::request<http::string_body> req;
-            http::read(stream, buf, req, ec);
-            if (ec)
-                return;
-            http::response<http::string_body> res(http::status::ok, req.version());
-            res.set(http::field::content_type, "text/plain");
-            res.body() = req.body();
-            res.prepare_payload();
-            http::write(stream, res, ec);
-        } catch (const std::exception&) {
-        }
-    }
-
-    asio::io_context io_;
-    std::shared_ptr<asio::ssl::context> ctx_;
-    tcp::acceptor acceptor_{io_};
-    uint16_t port_ = 0;
-    std::thread thread_;
-};
-
 // https over SOCKS5 隧道：TLS handshake 在隧道上完成；证书校验按目标 host
 //（自签证书 + extra_trust_pem 注入信任，SAN 含 IP:127.0.0.1）
 TEST_F(Socks5Fixture, HttpsOverTunnel)
@@ -294,16 +220,17 @@ TEST_F(Socks5Fixture, HttpsOverTunnel)
         }
     }
     ASSERT_FALSE(cert.empty());
-    TlsEchoServer tls;
-    backend = std::make_shared<qjsbind::net::BeastFetchBackend>(
-        rt.io(), qjsbind::net::TlsOptions{true, {cert}});
+    wpt_test::TlsEchoServer tls;
+    auto transport = std::make_shared<fetch::BeastTransport>(
+        rt.io(), fetch::TlsOptions{true, {cert}});
+    client = std::make_unique<fetch::Client>(rt.io(), transport);
     base = wpt.base_url();
     proxy_ = std::make_shared<qjsbind::net::wpt::Socks5TestServer>();
     proxy_->start();
-    const qjsbind::net::Socks5Proxy p{proxy_->host(), proxy_->port(), std::nullopt};
-    auto interceptor = std::make_shared<qjsbind::web::Socks5ProxyInterceptor>(
-        backend, [p](const std::string&) { return p; });
-    qjsbind::web::install_web_apis(ctx, backend, {interceptor});
+    const fetch::Socks5Proxy p{proxy_->host(), proxy_->port(), std::nullopt};
+    client->use(std::make_shared<fetch::Socks5ProxyMiddleware>(
+        transport, [p](const std::string&) { return p; }));
+    qjsbind::web::install_web_apis(ctx, *client);
     Value r = ctx.eval(
         "fetch('" + tls.base_url() + "/echo', {method: 'POST', body: 'tls over socks5'})"
         ".then(x => { globalThis.__h = x.status + '|' + x.headers.get('content-type');"

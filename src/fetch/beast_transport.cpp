@@ -1,7 +1,12 @@
-﻿// qjsbind_net 网络层实现 —— 见 http_client.hpp 设计注释
-#include "net/http_backend.hpp"
-#include <qjsbind/std_exec.hpp>
-#include "net/http_client.hpp"
+// fetchcore —— BeastTransport 实现（原 qjsbind_net http_client.cpp 演进）
+//
+// 设计注释见 include/fetch/beast_transport.hpp。本文件是 fetchcore 的实现侧：
+// 只依赖 fetch 公共类型 + asio/beast/OpenSSL，无任何 quickjs/qjsbind 依赖。
+#include "socks5.hpp"
+#include "cacert_embedded.hpp" // 脚本生成：fetch::embedded_cacert_pem
+
+#include <fetch/beast_transport.hpp>
+#include <fetch/body.hpp> // BodySource 完整定义（BeastBodySource 继承 + shared_ptr 转换）
 
 #include <boost/asio/ssl.hpp>
 #include <boost/asio/ip/tcp.hpp>
@@ -22,9 +27,7 @@
 #include <openssl/pem.h>
 #include <openssl/x509.h>
 
-#include "net/cacert_embedded.hpp" // 脚本生成：qjsbind::net::embedded_cacert_pem
-
-namespace qjsbind::net {
+namespace fetch {
 namespace {
 
 using boost::asio::ip::tcp;
@@ -115,7 +118,7 @@ ssl::context make_ssl_context(const TlsOptions& tls) {
 }
 
 // 组装 beast 请求（不含 IO）
-http::request<http::string_body> make_beast_request(const HttpRequest& req,
+http::request<http::string_body> make_beast_request(const Request& req,
                                                     const ParsedUrl& url) {
     http::request<http::string_body> hreq;
     hreq.method_string(req.method);
@@ -145,7 +148,7 @@ http::request<http::string_body> make_beast_request(const HttpRequest& req,
 struct ResponseHead {
     int status = 0;
     std::string reason;
-    std::vector<web::Header> headers;
+    Headers headers;
 };
 
 // 完成 write + read_header（v1 do_exchange 的头部段）。返回 head + 移交 body 解析器。
@@ -153,7 +156,7 @@ struct ResponseHead {
 // 同一 parser 继续 async_read_some（由 BeastBodySource 持有）。
 template <class Stream>
 std_exec::task<std::pair<ResponseHead, beast::flat_buffer>>
-do_exchange_head(Stream& stream, const HttpRequest& req, const ParsedUrl& url,
+do_exchange_head(Stream& stream, const Request& req, const ParsedUrl& url,
                  std::shared_ptr<http::response_parser<http::buffer_body>> parser) {
     http::request<http::string_body> hreq = make_beast_request(req, url);
     co_await http::async_write(stream, hreq, exec::asio::use_sender);
@@ -171,7 +174,7 @@ do_exchange_head(Stream& stream, const HttpRequest& req, const ParsedUrl& url,
                                                           std::move(buffer)};
 }
 
-// ---- BeastBodySource：流式 body 源（web::BodySource 的 beast 实现）----
+// ---- BeastBodySource：流式 body 源（fetch::BodySource 的 beast 实现）----
 // 持有 stream（shared_ptr：头阶段与 body 阶段的 stop_callback 共享同一对象）、
 // flat_buffer、response_parser<buffer_body> 与 64 KiB 读缓冲。
 // read() = http::async_read_some → 返回本次消费的字节；parser.is_done() → nullopt
@@ -179,7 +182,7 @@ do_exchange_head(Stream& stream, const HttpRequest& req, const ParsedUrl& url,
 // cancel() = lowest_layer().close()（同时唤醒挂起的 read，以 operation_aborted 完成）。
 // stop_callback 构造时注册（arm_stop）、析构时注销；回调跨线程，仅触碰 socket。
 template <class Stream>
-class BeastBodySource : public web::BodySource,
+class BeastBodySource : public BodySource,
                         public std::enable_shared_from_this<BeastBodySource<Stream>> {
 public:
     BeastBodySource(std::shared_ptr<Stream> stream, beast::flat_buffer buffer,
@@ -264,7 +267,7 @@ private:
 
 } // namespace
 
-// 建立到目标的 TCP 连接：直连（resolver + connect）或经 SOCKS5 隧道（§3.4）。
+// 建立到目标的 TCP 连接：直连（resolver + connect）或经 SOCKS5 隧道。
 // 返回共享 socket：调用方在其上挂取消回调（connect / socks5 握手 / TLS 握手 /
 // 读头全程可取消；body 阶段由 BeastBodySource 接管）。
 std_exec::task<std::shared_ptr<tcp::socket>>
@@ -298,12 +301,10 @@ connect_tcp(boost::asio::io_context& io, const std::string& host, const std::str
     co_return sock;
 }
 
-std_exec::task<HttpResponse> http_request(boost::asio::io_context& io, HttpRequest req,
-                                      TlsOptions tls, std::stop_token st,
-                                      std::optional<Socks5Proxy> proxy) {
+std_exec::task<Response> BeastTransport::request(const Request& req, std::stop_token st) {
     const ParsedUrl url = parse_url(req.url);
 
-    auto sock = co_await connect_tcp(io, url.host, url.port, st, proxy);
+    auto sock = co_await connect_tcp(io_, url.host, url.port, st, std::nullopt);
     // 取消回调挂共享 socket（同 connect_tcp 内的回调，双保险覆盖 connect 与
     // 后续阶段之间的窗口；cancel 幂等）。
     std::optional<std::stop_callback<std::function<void()>>> head_stop_cb;
@@ -314,11 +315,11 @@ std_exec::task<HttpResponse> http_request(boost::asio::io_context& io, HttpReque
         });
     }
 
-    std::shared_ptr<web::BodySource> body;
+    std::shared_ptr<BodySource> body;
     ResponseHead head;
     if (url.scheme == "https") {
         // ctx 随 body 源存活（boost 契约：context 须比 stream 活得久，BeastBodySource 持有）
-        auto ctx = std::make_shared<ssl::context>(make_ssl_context(tls));
+        auto ctx = std::make_shared<ssl::context>(make_ssl_context(tls_));
         // 隧道/直连 socket 直接移交 ssl::stream（SOCKS5 隧道上照常 TLS handshake）
         auto stream = std::make_shared<ssl::stream<tcp::socket>>(std::move(*sock), *ctx);
         stream->set_verify_callback(ssl::host_name_verification(url.host));
@@ -353,7 +354,7 @@ std_exec::task<HttpResponse> http_request(boost::asio::io_context& io, HttpReque
         }
     }
 
-    HttpResponse out;
+    Response out;
     out.status = head.status;
     out.reason = std::move(head.reason);
     out.headers = std::move(head.headers);
@@ -361,42 +362,61 @@ std_exec::task<HttpResponse> http_request(boost::asio::io_context& io, HttpReque
     co_return out;
 }
 
-// ---- BeastFetchBackend：FetchBackend 适配（net 层类型 → web 层类型）----
-namespace {
-// net 层 HttpRequest ← web 层 HttpRequest（同名同构，逐字段拷贝）
-HttpRequest net_request_from_web(const web::HttpRequest& req)
-{
-    HttpRequest r;
-    r.method = req.method;
-    r.url = req.url;
-    r.headers = req.headers;
-    r.body = req.body;
-    return r;
-}
-// web 层 HttpResponse ← net 层 HttpResponse
-web::HttpResponse web_response_from_net(HttpResponse resp)
-{
-    web::HttpResponse out;
-    out.status = resp.status;
-    out.reason = std::move(resp.reason);
-    out.headers = std::move(resp.headers);
-    out.body = std::move(resp.body);
-    return out;
-}
-} // namespace
+std_exec::task<Response> BeastTransport::request_via_socks5(const Request& req,
+                                                            const Socks5Proxy& proxy,
+                                                            std::stop_token st) {
+    const ParsedUrl url = parse_url(req.url);
 
-std_exec::task<web::HttpResponse> BeastFetchBackend::request(const web::HttpRequest& req,
-                                                         std::stop_token st) {
-    HttpResponse resp = co_await http_request(io_, net_request_from_web(req), tls_,
-                                              std::move(st), std::nullopt);
-    co_return web_response_from_net(std::move(resp));
+    auto sock = co_await connect_tcp(io_, url.host, url.port, st, proxy);
+    std::optional<std::stop_callback<std::function<void()>>> head_stop_cb;
+    if (st.stop_possible()) {
+        head_stop_cb.emplace(st, [sock] {
+            boost::system::error_code ec;
+            sock->cancel(ec);
+        });
+    }
+
+    std::shared_ptr<BodySource> body;
+    ResponseHead head;
+    if (url.scheme == "https") {
+        auto ctx = std::make_shared<ssl::context>(make_ssl_context(tls_));
+        auto stream = std::make_shared<ssl::stream<tcp::socket>>(std::move(*sock), *ctx);
+        stream->set_verify_callback(ssl::host_name_verification(url.host));
+        if (head_stop_cb)
+            head_stop_cb.emplace(st, [stream] {
+                boost::system::error_code ec;
+                stream->next_layer().cancel(ec);
+            });
+        co_await stream->async_handshake(ssl::stream_base::client, exec::asio::use_sender);
+        auto parser = std::make_shared<http::response_parser<http::buffer_body>>();
+        auto [h, buffer] = co_await do_exchange_head(*stream, req, url, parser);
+        head = std::move(h);
+        if (req.method != "HEAD" && head.status != 204 && head.status != 205 &&
+            head.status != 304) {
+            auto src = std::make_shared<BeastBodySource<ssl::stream<tcp::socket>>>(
+                std::move(stream), std::move(buffer), std::move(parser), std::move(ctx));
+            src->arm_stop(st, src);
+            body = std::move(src);
+        }
+    } else {
+        auto parser = std::make_shared<http::response_parser<http::buffer_body>>();
+        auto [h, buffer] = co_await do_exchange_head(*sock, req, url, parser);
+        head = std::move(h);
+        if (req.method != "HEAD" && head.status != 204 && head.status != 205 &&
+            head.status != 304) {
+            auto src = std::make_shared<BeastBodySource<tcp::socket>>(
+                std::move(sock), std::move(buffer), std::move(parser));
+            src->arm_stop(st, src);
+            body = std::move(src);
+        }
+    }
+
+    Response out;
+    out.status = head.status;
+    out.reason = std::move(head.reason);
+    out.headers = std::move(head.headers);
+    out.body = std::move(body);
+    co_return out;
 }
 
-std_exec::task<web::HttpResponse> BeastFetchBackend::request_via_socks5(
-    const web::HttpRequest& req, const Socks5Proxy& proxy, std::stop_token st) {
-    HttpResponse resp = co_await http_request(io_, net_request_from_web(req), tls_,
-                                              std::move(st), proxy);
-    co_return web_response_from_net(std::move(resp));
-}
-
-} // namespace qjsbind::net
+} // namespace fetch

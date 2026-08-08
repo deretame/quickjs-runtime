@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""下载 Mozilla CA bundle 并生成嵌入头文件 src/net/cacert_embedded.hpp。
+"""下载 Mozilla CA bundle 并生成嵌入头文件 src/fetch/cacert_embedded.hpp。
 
 生成的头文件被 gitignore（构建产物，与 vcpkg 同模式）。
 来源：curl.se/ca/cacert.pem（Mozilla CA bundle），另有 raw.githubusercontent 备源。
@@ -12,7 +12,7 @@ URLS = [
     "https://curl.se/ca/cacert.pem",
     "https://raw.githubusercontent.com/curl/curl-ca-bundle/master/ca-bundle.crt",
 ]
-OUT = pathlib.Path(__file__).resolve().parent.parent / "src" / "net" / "cacert_embedded.hpp"
+OUT = pathlib.Path(__file__).resolve().parent.parent / "src" / "fetch" / "cacert_embedded.hpp"
 
 
 def fetch() -> bytes:
@@ -38,11 +38,11 @@ def main() -> int:
 // Source: Mozilla CA bundle (curl.se/ca/cacert.pem), embedded for TLS verification.
 #pragma once
 #include <string_view>
-namespace qjsbind::net {{
+namespace fetch {{
 inline constexpr std::string_view embedded_cacert_pem = R"QJS_CERT(
 {text}
 )QJS_CERT";
-}} // namespace qjsbind::net
+}} // namespace fetch
 """
     OUT.parent.mkdir(parents=True, exist_ok=True)
     OUT.write_text(out, encoding="utf-8")

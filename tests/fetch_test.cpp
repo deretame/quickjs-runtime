@@ -10,7 +10,7 @@
 #include <gtest/gtest.h>
 #include <qjsbind/qjsbind.hpp>
 #include <qjsbind/web/web.hpp>
-#include <net/http_backend.hpp>
+#include <fetch/client.hpp>
 #include "wpt_server.hpp"
 
 #include <boost/asio/steady_timer.hpp>
@@ -26,12 +26,11 @@ namespace {
 struct FetchFixture : ::testing::Test {
     Runtime rt;
     Context ctx = rt.main_context();
-    std::shared_ptr<qjsbind::net::BeastFetchBackend> backend;
+    fetch::Client client{rt.io()};
 
     FetchFixture()
-        : backend(std::make_shared<qjsbind::net::BeastFetchBackend>(rt.io()))
     {
-        qjsbind::web::install_web_apis(ctx, backend);
+        qjsbind::web::install_web_apis(ctx, client);
     }
 };
 

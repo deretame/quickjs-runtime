@@ -9,7 +9,7 @@
 #include <gtest/gtest.h>
 #include <qjsbind/qjsbind.hpp>
 #include <qjsbind/web/web.hpp>
-#include <net/http_backend.hpp>
+#include <fetch/client.hpp>
 
 #include "wpt_server.hpp"
 
@@ -126,8 +126,8 @@ struct WptRunner : ::testing::Test {
     {
         qjs::Runtime rt;
         qjs::Context ctx = rt.main_context();
-        auto backend = std::make_shared<qjsbind::net::BeastFetchBackend>(rt.io());
-        qjsbind::web::install_web_apis(ctx, backend);
+        fetch::Client client{rt.io()};
+        qjsbind::web::install_web_apis(ctx, client);
 
         const std::string shim = read_file(root_dir() + "/tests/wpt_shim.js");
         qjs::Value r = ctx.eval(shim);

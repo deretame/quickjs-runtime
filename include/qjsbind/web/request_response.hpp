@@ -14,7 +14,6 @@
 #include <qjsbind/web/errors.hpp>
 #include <qjsbind/web/headers.hpp>
 #include <qjsbind/web/stream.hpp>
-#include <qjsbind/web/net.hpp>
 #include <qjsbind/web/url.hpp>
 
 #include <stdexec/execution.hpp>

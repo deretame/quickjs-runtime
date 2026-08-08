@@ -9,8 +9,9 @@
 // 标准 C++26 的 <execution> 提供 std::exec::task；本项目的 stdexec 实现
 // 对应的就是 experimental::execution。这里定义别名 std_exec，
 // 代码统一写 std_exec::task<T>（即 std::exec::task 的参考实现）。
+//
+// 自 fetch_cpp_decoupling.md v3 起，本头只是 fetchcore 的 fetch/task.hpp
+// 转发（别名定义在核心库内，避免两份实现漂移）。
 #pragma once
 
-#include <exec/task.hpp>
-
-namespace std_exec = ::experimental::execution;
+#include <fetch/task.hpp>

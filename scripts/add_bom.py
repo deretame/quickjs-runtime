@@ -13,14 +13,12 @@ FILES = [
     "include/qjsbind/web/events.hpp",
     "include/qjsbind/web/fetch.hpp",
     "include/qjsbind/web/headers.hpp",
-    "include/qjsbind/web/net.hpp",
     "include/qjsbind/web/request_response.hpp",
     "include/qjsbind/web/timers.hpp",
     "include/qjsbind/web/url.hpp",
     "include/qjsbind/web/web.hpp",
-    "src/net/http_backend.hpp",
-    "src/net/http_client.cpp",
-    "src/net/http_client.hpp",
+    "src/fetch/beast_transport.cpp",
+    "src/fetch/socks5.cpp",
     "tests/fetch_test.cpp",
 ]
 

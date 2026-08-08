@@ -36,10 +36,17 @@ inline int blocked_port_of(const std::string& url)
     auto r = boost::urls::parse_uri_reference(url);
     if (r.has_error() || !r->has_port())
         return -1;
+    const std::string ps(r->port());
+    // 端口必须是纯数字（boost 语法已保证，此处纵深防御：非数字 → 不拦截）
+    if (ps.empty())
+        return -1;
+    for (const char c : ps)
+        if (c < '0' || c > '9')
+            return -1;
     try {
-        const int p = std::stoi(std::string(r->port()));
+        const int p = std::stoi(ps);
         return is_blocked_port(p) ? p : -1;
-    } catch (const std::invalid_argument&) {
+    } catch (const std::exception&) { // invalid_argument / out_of_range（超长数字）
         return -1;
     }
 }
@@ -48,7 +55,7 @@ inline int blocked_port_of(const std::string& url)
 inline void check_url_ports(const std::string& url)
 {
     const int p = blocked_port_of(url);
-    if (p > 0)
+    if (p != -1) // 含端口 0（is_blocked_port(0)==true，规范清单本含 0 防占位）
         throw Error("fetch: URL 端口 " + std::to_string(p) + " 被禁止");
 }
 

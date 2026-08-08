@@ -178,9 +178,11 @@ private:
 
 inline std_exec::task<Response> Client::fetch_once(const Request& req, std::stop_token st)
 {
+    check_url_ports(req.url); // 公开 API 也检查（security review LOW：防 C++ 调用方绕过）
     Handler h = make_chain(mws_, transport_);
     if (opt_.auto_decompress) {
-        auto ae = std::make_shared<AcceptEncodingMiddleware>();
+        auto ae =
+            std::make_shared<AcceptEncodingMiddleware>(opt_.max_decompressed_bytes);
         h = wrap_middleware(ae, std::move(h));
     }
     co_return co_await h(req, std::move(st));

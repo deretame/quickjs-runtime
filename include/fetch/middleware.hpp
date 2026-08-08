@@ -298,6 +298,11 @@ private:
 // ---- AcceptEncodingMiddleware（fetch_design.md §5.6）----
 class AcceptEncodingMiddleware : public Middleware {
 public:
+    // total_limit：自动解压的总字节上限（0 = 无限制；默认由 Client::Options
+    // max_decompressed_bytes 传入）
+    explicit AcceptEncodingMiddleware(size_t total_limit = 0)
+        : total_limit_(total_limit) {}
+
     std_exec::task<Response> intercept(const Request& req, std::stop_token st,
                                        Handler next) override
     {
@@ -328,12 +333,15 @@ public:
                 else
                     co_return resp; // 未知编码：透传原始字节
                 strip_headers(resp.headers, {"content-encoding", "content-length"});
-                resp.body =
-                    std::make_shared<DecompressSource>(std::move(resp.body), kind);
+                resp.body = std::make_shared<DecompressSource>(std::move(resp.body), kind,
+                                                                total_limit_);
             }
         }
         co_return resp;
     }
+
+private:
+    size_t total_limit_ = 0;
 };
 
 // ---- IntegritySource：SRI 末端校验（fetch_design.md §4.5）----

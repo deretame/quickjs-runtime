@@ -66,12 +66,17 @@ ParsedUrl parse_url(const std::string& url) {
     if (uv.host().empty())
         throw std::invalid_argument("url: 缺少 host");
     // 拒绝含控制字符的 host（pct-encoded %0d%0a 等解码后进 Host 头/SNI/TLS
-    // 校验——security review LOW；合法 reg-name 不含控制字符）
+    // 校验——security review LOW；合法 reg-name 不含控制字符）。
+    // 解码后与编码形式双检查：uv.host() 为解码文本，encoded_host() 兜底。
     {
         const std::string h = std::string(uv.host());
         for (unsigned char c : h)
             if (c < 0x20 || c == 0x7F)
                 throw std::invalid_argument("url: host 含控制字符");
+        const std::string eh = std::string(uv.encoded_host());
+        if (eh.find("%0") != std::string::npos || eh.find("%1") != std::string::npos ||
+            eh.find("%7f") != std::string::npos || eh.find("%7F") != std::string::npos)
+            throw std::invalid_argument("url: host 含控制字符");
     }
     ParsedUrl out;
     out.scheme = std::string(uv.scheme());

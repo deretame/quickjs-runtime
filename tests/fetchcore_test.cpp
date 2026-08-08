@@ -325,6 +325,16 @@ TEST(FetchcoreDirect, BlockedPortRejected)
 {
     Probe p;
     p.run([&]() -> std_exec::task<void> {
+        // 端口 0 也在 #port-blocking 清单（security review LOW：p != -1 拦截）
+        fetch::Request r0;
+        r0.url = "http://127.0.0.1:0/x";
+        bool threw0 = false;
+        try {
+            (void)co_await p.client.fetch(std::move(r0));
+        } catch (const fetch::Error&) {
+            threw0 = true;
+        }
+        EXPECT_TRUE(threw0);
         fetch::Request req;
         req.url = "http://127.0.0.1:22/x"; // SSH 端口在 fetch 规范 #port-blocking 清单
         bool threw = false;

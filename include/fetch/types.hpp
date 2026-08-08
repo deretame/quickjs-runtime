@@ -64,6 +64,9 @@ struct Options {
     TlsOptions tls{};            // 默认 BeastTransport 的 TLS 配置（注入自定义 Transport 时忽略）
     bool auto_decompress = true; // 内建 Accept-Encoding 中间件开关（固定最外层）
     int max_redirects = 20;
+    // 自动解压的总字节上限（gzip bomb 防护；security review MEDIUM）。
+    // 0 = 无限制；默认 256 MiB——单块上限 1 MiB 控峰值，此值控总量。
+    size_t max_decompressed_bytes = 256 * 1024 * 1024;
 };
 
 // ---- 头操作工具（原 interceptor.hpp 迁入）----

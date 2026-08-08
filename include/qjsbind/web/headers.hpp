@@ -208,6 +208,9 @@ struct HeadersImpl {
     // 内部直存（fetch 响应组装用，绕过 guard 检查；name 仍需小写化）。
     // 纵深防御：响应头来自网络解析（beast 已保证无裸 CR/LF/NUL），此处再拦一道。
     void append_raw(const std::string& name, const std::string& value) {
+        for (const char c : name)
+            if (c == '\r' || c == '\n' || c == '\0')
+                throw std::runtime_error("Headers: 响应头 name 含非法字符");
         for (const char c : value)
             if (c == '\r' || c == '\n' || c == '\0')
                 throw std::runtime_error("Headers: 响应头 value 含非法字符");
